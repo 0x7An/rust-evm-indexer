@@ -7,7 +7,7 @@ use indexer_rs::{
     domain::job::{JobStatus, JobType},
     infra::postgres::{
         connection::build_pool,
-        job_repository::{EnqueueResult, JobRepository, NewJob},
+        job_repository::{EnqueueResult, JobRepository, JobStatusCount, NewJob},
     },
 };
 use uuid::Uuid;
@@ -58,6 +58,14 @@ fn cleanup_test_jobs(conn: &mut PgConnection) {
 
 fn key(name: &str) -> String {
     format!("it:{name}:{}", Uuid::new_v4())
+}
+
+fn count_for(counts: &[JobStatusCount], status: JobStatus) -> i64 {
+    counts
+        .iter()
+        .find(|row| row.status == status.to_string())
+        .map(|row| row.count)
+        .unwrap_or(0)
 }
 
 #[test]
@@ -154,6 +162,67 @@ fn lease_next_for_type_skips_other_job_types() {
 
     assert_eq!(leased.id, expected_id);
     assert_eq!(leased.job_type, JobType::IngestRange.to_string());
+}
+
+#[test]
+fn status_counts_group_and_filter_jobs() {
+    let ctx = setup();
+    let chain_id = 84532;
+    let other_chain_id = 84533;
+
+    ctx.repo
+        .enqueue(NewJob::new(JobType::IngestRange, chain_id, key("status-a")).with_range(1, 5))
+        .expect("insert first ingest job");
+    ctx.repo
+        .enqueue(NewJob::new(JobType::IngestRange, chain_id, key("status-b")).with_range(6, 10))
+        .expect("insert second ingest job");
+    ctx.repo
+        .enqueue(NewJob::new(
+            JobType::BackfillRange,
+            chain_id,
+            key("status-backfill"),
+        ))
+        .expect("insert backfill job");
+    ctx.repo
+        .enqueue(NewJob::new(
+            JobType::IngestRange,
+            other_chain_id,
+            key("status-other-chain"),
+        ))
+        .expect("insert other chain job");
+
+    let leased = ctx
+        .repo
+        .lease_next_for_type_and_chain(
+            "worker-a",
+            Duration::seconds(60),
+            JobType::IngestRange,
+            chain_id,
+        )
+        .expect("lease query")
+        .expect("lease ingest job");
+    ctx.repo
+        .mark_running(leased.id)
+        .expect("mark leased job running");
+    ctx.repo
+        .mark_succeeded(leased.id)
+        .expect("mark leased job succeeded");
+
+    let ingest_counts = ctx
+        .repo
+        .status_counts(Some(chain_id), None, Some(JobType::IngestRange))
+        .expect("load ingest status counts");
+    assert_eq!(count_for(&ingest_counts, JobStatus::Queued), 1);
+    assert_eq!(count_for(&ingest_counts, JobStatus::Succeeded), 1);
+    assert_eq!(ingest_counts.iter().map(|row| row.count).sum::<i64>(), 2);
+
+    let chain_counts = ctx
+        .repo
+        .status_counts(Some(chain_id), None, None)
+        .expect("load chain status counts");
+    assert_eq!(count_for(&chain_counts, JobStatus::Queued), 2);
+    assert_eq!(count_for(&chain_counts, JobStatus::Succeeded), 1);
+    assert_eq!(chain_counts.iter().map(|row| row.count).sum::<i64>(), 3);
 }
 
 #[test]

@@ -86,14 +86,15 @@ This repository is intended to grow through small, reviewable checkpoints:
 6. Ledger query API
 7. Ingest worker
 8. Contract backfill planning and checkpoints
-9. Replay and reorg handling
-10. Observability and doctor CLI
+9. Continuous worker loop and job status CLI
+10. Repair/replay support
+11. Observability and doctor CLI
 
 Each checkpoint should keep the project buildable, include focused validation, and produce a clear commit/PR boundary.
 
 ## Current Status
 
-Checkpoint 8 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that leases and executes ingestion jobs, source checkpoints, and a read API for querying indexed ledger slices. Replay/reorg handling and observability will be introduced in later checkpoints.
+Checkpoint 9 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, and a read API for querying indexed ledger slices. Repair/replay support and observability will be introduced in later checkpoints.
 
 ## Development
 
@@ -238,6 +239,42 @@ cargo run -- backfill-contract \
 ```
 
 Backfill jobs use idempotency keys based on `source_id`, `from_block`, and `to_block`, so rerunning the same command reports existing jobs instead of duplicating work. After a worker successfully ingests a range, it advances the checkpoint only across contiguous completed ranges, so progress does not skip gaps when jobs finish out of order.
+
+Drain a planned full-history backfill until the queue is empty:
+
+```sh
+cargo run -- worker run \
+  --worker-id polygon-worker \
+  --chain-id 137 \
+  --lease-seconds 300 \
+  --chunk-size 100 \
+  --stop-when-idle
+```
+
+For daemon-style operation, omit `--stop-when-idle`; the worker will keep polling for new jobs. Use `--max-jobs` for bounded local smoke tests.
+
+Inspect job progress:
+
+```sh
+cargo run -- jobs status \
+  --chain-id 137 \
+  --contract 0x2953399124f0cbb46d2cbacd8a89cf0599974963 \
+  --job-type INGEST_RANGE
+```
+
+For an ERC-721 full-history run such as Bored Ape Yacht Club, use the Ethereum chain id, the BAYC contract, and a deployment/start block:
+
+```sh
+cargo run -- backfill-contract \
+  --chain-name ethereum-mainnet \
+  --chain-id 1 \
+  --finality-confirmations 64 \
+  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
+  --standard erc721 \
+  --from-block <bayc-deploy-block> \
+  --to-block latest \
+  --range-size 1000
+```
 
 ## HTTP API
 

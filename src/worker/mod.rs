@@ -106,6 +106,30 @@ impl IngestWorker {
         }
     }
 
+    pub async fn run_until_idle(&self, max_jobs: Option<usize>) -> Result<WorkerRunSummary> {
+        let mut summary = WorkerRunSummary::default();
+
+        loop {
+            if max_jobs.is_some_and(|max_jobs| summary.attempted_jobs() >= max_jobs) {
+                summary.stop_reason = WorkerRunStopReason::MaxJobsReached;
+                return Ok(summary);
+            }
+
+            match self.run_once().await? {
+                WorkerOutcome::NoJob => {
+                    summary.stop_reason = WorkerRunStopReason::Idle;
+                    return Ok(summary);
+                }
+                WorkerOutcome::Processed { .. } => {
+                    summary.processed_jobs += 1;
+                }
+                WorkerOutcome::Failed { .. } => {
+                    summary.failed_jobs += 1;
+                }
+            }
+        }
+    }
+
     async fn execute_job(&self, job: &JobRow) -> Result<ScanSummary> {
         let job_type = job
             .job_type
@@ -166,6 +190,35 @@ impl IngestWorker {
 
         Ok(summary)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRunSummary {
+    pub processed_jobs: usize,
+    pub failed_jobs: usize,
+    pub stop_reason: WorkerRunStopReason,
+}
+
+impl WorkerRunSummary {
+    pub fn attempted_jobs(&self) -> usize {
+        self.processed_jobs + self.failed_jobs
+    }
+}
+
+impl Default for WorkerRunSummary {
+    fn default() -> Self {
+        Self {
+            processed_jobs: 0,
+            failed_jobs: 0,
+            stop_reason: WorkerRunStopReason::Idle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerRunStopReason {
+    Idle,
+    MaxJobsReached,
 }
 
 #[derive(Debug, Clone)]

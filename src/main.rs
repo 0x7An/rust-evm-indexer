@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr, time::Duration as StdDuration};
 
 use anyhow::{Context, Result, bail};
 use chrono::Duration;
@@ -9,12 +9,12 @@ use indexer_rs::{
         backfill::{BackfillPlan, plan_backfill_jobs},
         ingest::{ingest_source_range, normalize_address, redact_rpc_url, resolve_finalized_range},
     },
-    domain::job::JobType,
+    domain::job::{JobStatus, JobType},
     infra::{
         evm::{decoder::TokenStandard, rpc::EvmRpcClient},
         postgres::{
             connection::build_pool,
-            job_repository::{EnqueueResult, NewJob},
+            job_repository::{EnqueueResult, JobStatusCount, NewJob},
             repositories::PostgresRepositories,
         },
     },
@@ -192,6 +192,12 @@ enum Commands {
         #[command(subcommand)]
         command: WorkerCommands,
     },
+
+    /// Inspect durable ingestion jobs.
+    Jobs {
+        #[command(subcommand)]
+        command: JobCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -221,6 +227,67 @@ enum WorkerCommands {
         /// Maximum block span per eth_getLogs call.
         #[arg(long, default_value_t = 10)]
         chunk_size: u64,
+    },
+
+    /// Continuously lease and execute queued ingestion jobs.
+    Run {
+        /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
+        #[arg(long, env = "EVM_RPC_URL", hide_env_values = true)]
+        rpc_url: Option<String>,
+
+        /// Postgres database URL. Prefer DATABASE_URL for local use.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+
+        /// Stable worker id recorded in job attempts.
+        #[arg(long, default_value = "local-worker")]
+        worker_id: String,
+
+        /// Optional chain id to restrict leased jobs.
+        #[arg(long)]
+        chain_id: Option<i64>,
+
+        /// Lease duration for each job.
+        #[arg(long, default_value_t = 300)]
+        lease_seconds: i64,
+
+        /// Maximum block span per eth_getLogs call.
+        #[arg(long, default_value_t = 10)]
+        chunk_size: u64,
+
+        /// Stop after this many job attempts.
+        #[arg(long)]
+        max_jobs: Option<usize>,
+
+        /// Stop once the queue is empty instead of polling forever.
+        #[arg(long)]
+        stop_when_idle: bool,
+
+        /// Sleep duration between empty queue polls.
+        #[arg(long, default_value_t = 1_000)]
+        idle_sleep_ms: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum JobCommands {
+    /// Print durable job counts grouped by status.
+    Status {
+        /// Postgres database URL. Prefer DATABASE_URL for local use.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+
+        /// Optional chain id filter.
+        #[arg(long)]
+        chain_id: Option<i64>,
+
+        /// Optional contract source filter. Requires --chain-id.
+        #[arg(long)]
+        contract: Option<String>,
+
+        /// Optional job type filter, such as INGEST_RANGE.
+        #[arg(long)]
+        job_type: Option<String>,
     },
 }
 
@@ -343,6 +410,39 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            WorkerCommands::Run {
+                rpc_url,
+                database_url,
+                worker_id,
+                chain_id,
+                lease_seconds,
+                chunk_size,
+                max_jobs,
+                stop_when_idle,
+                idle_sleep_ms,
+            } => {
+                let rpc_url = rpc_url_from_args(rpc_url)?;
+                worker_run(
+                    rpc_url,
+                    database_url,
+                    worker_id,
+                    chain_id,
+                    lease_seconds,
+                    chunk_size,
+                    max_jobs,
+                    stop_when_idle,
+                    idle_sleep_ms,
+                )
+                .await
+            }
+        },
+        Commands::Jobs { command } => match command {
+            JobCommands::Status {
+                database_url,
+                chain_id,
+                contract,
+                job_type,
+            } => jobs_status(database_url, chain_id, contract, job_type),
         },
     }
 }
@@ -635,6 +735,98 @@ async fn worker_run_once(
         bail!("lease-seconds must be greater than zero");
     }
 
+    let worker = build_worker(
+        rpc_url,
+        database_url,
+        worker_id,
+        chain_id,
+        lease_seconds,
+        chunk_size,
+    )?;
+
+    let outcome = worker.run_once().await?;
+    print_worker_outcome(&outcome);
+    if outcome.is_terminal_failure() {
+        if let WorkerOutcome::Failed { job_id, .. } = outcome {
+            bail!("ingest job {job_id} is dead-lettered");
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn worker_run(
+    rpc_url: String,
+    database_url: String,
+    worker_id: String,
+    chain_id: Option<i64>,
+    lease_seconds: i64,
+    chunk_size: u64,
+    max_jobs: Option<usize>,
+    stop_when_idle: bool,
+    idle_sleep_ms: u64,
+) -> Result<()> {
+    if max_jobs == Some(0) {
+        bail!("max-jobs must be greater than zero when provided");
+    }
+
+    let worker = build_worker(
+        rpc_url,
+        database_url,
+        worker_id,
+        chain_id,
+        lease_seconds,
+        chunk_size,
+    )?;
+    let mut attempted_jobs = 0usize;
+    let mut printed_idle = false;
+
+    loop {
+        if max_jobs.is_some_and(|max_jobs| attempted_jobs >= max_jobs) {
+            println!("Reached max job attempts: {attempted_jobs}");
+            return Ok(());
+        }
+
+        let outcome = worker.run_once().await?;
+        match &outcome {
+            WorkerOutcome::NoJob => {
+                if stop_when_idle {
+                    println!(
+                        "No queued jobs available. Worker stopped after {attempted_jobs} job attempts."
+                    );
+                    return Ok(());
+                }
+                if !printed_idle {
+                    println!("No queued jobs available. Polling every {idle_sleep_ms}ms.");
+                    printed_idle = true;
+                }
+                tokio::time::sleep(StdDuration::from_millis(idle_sleep_ms)).await;
+            }
+            WorkerOutcome::Processed { .. } | WorkerOutcome::Failed { .. } => {
+                attempted_jobs += 1;
+                printed_idle = false;
+                print_worker_outcome(&outcome);
+            }
+        }
+    }
+}
+
+fn build_worker(
+    rpc_url: String,
+    database_url: String,
+    worker_id: String,
+    chain_id: Option<i64>,
+    lease_seconds: i64,
+    chunk_size: u64,
+) -> Result<IngestWorker> {
+    if lease_seconds <= 0 {
+        bail!("lease-seconds must be greater than zero");
+    }
+    if chunk_size == 0 {
+        bail!("chunk-size must be greater than zero");
+    }
+
     let pool = build_pool(&database_url).context("build postgres pool")?;
     let repositories = PostgresRepositories::new(pool);
     let mut worker = IngestWorker::new(
@@ -651,7 +843,11 @@ async fn worker_run_once(
         worker = worker.with_chain_id(chain_id);
     }
 
-    match worker.run_once().await? {
+    Ok(worker)
+}
+
+fn print_worker_outcome(outcome: &WorkerOutcome) {
+    match outcome {
         WorkerOutcome::NoJob => println!("No queued jobs available."),
         WorkerOutcome::Processed { job_id, summary } => {
             println!("Processed ingest job {job_id}.");
@@ -663,13 +859,74 @@ async fn worker_run_once(
             error,
         } => {
             println!("Ingest job {job_id} failed with status {status}: {error}");
-            if status == "dead_lettered" {
-                bail!("ingest job {job_id} is dead-lettered");
-            }
         }
     }
+}
+
+fn jobs_status(
+    database_url: String,
+    chain_id: Option<i64>,
+    contract: Option<String>,
+    job_type: Option<String>,
+) -> Result<()> {
+    let pool = build_pool(&database_url).context("build postgres pool")?;
+    let repositories = PostgresRepositories::new(pool);
+    let contract = contract
+        .map(|value| normalize_address(&value))
+        .transpose()
+        .context("normalize contract address")?;
+    let source_id = match contract {
+        Some(contract) => {
+            let chain_id = chain_id.context("--chain-id is required when --contract is used")?;
+            let source = repositories
+                .ledger()
+                .source_by_contract(chain_id, &contract)
+                .context("load source by contract")?
+                .context("contract source not found")?;
+            Some(source.id)
+        }
+        None => None,
+    };
+    let job_type = job_type
+        .map(|value| {
+            value
+                .parse::<JobType>()
+                .with_context(|| format!("parse job type {value}"))
+        })
+        .transpose()?;
+
+    let counts = repositories
+        .jobs()
+        .status_counts(chain_id, source_id, job_type)
+        .context("load job status counts")?;
+    print_job_status_counts(&counts);
 
     Ok(())
+}
+
+fn print_job_status_counts(counts: &[JobStatusCount]) {
+    let counts_by_status = counts
+        .iter()
+        .map(|row| (row.status.as_str(), row.count))
+        .collect::<HashMap<_, _>>();
+    let statuses = [
+        JobStatus::Queued,
+        JobStatus::Leased,
+        JobStatus::Running,
+        JobStatus::Succeeded,
+        JobStatus::Failed,
+        JobStatus::DeadLettered,
+        JobStatus::Cancelled,
+    ];
+    let mut total = 0;
+
+    println!("Job status:");
+    for status in statuses {
+        let count = counts_by_status.get(status.as_str()).copied().unwrap_or(0);
+        total += count;
+        println!("- {}: {}", status.as_str(), count);
+    }
+    println!("Total jobs: {total}");
 }
 
 fn print_backfill_plan(contract: &str, chain_name: &str, chain_id: i64, plan: &BackfillPlan) {

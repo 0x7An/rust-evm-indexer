@@ -1,5 +1,9 @@
 use chrono::{Duration, Utc};
-use diesel::{PgConnection, prelude::*};
+use diesel::{
+    PgConnection, QueryableByName,
+    prelude::*,
+    sql_types::{BigInt, Nullable, Text, Uuid as SqlUuid},
+};
 use uuid::Uuid;
 
 use crate::domain::job::{JobStatus, JobType};
@@ -73,6 +77,20 @@ impl From<NewJob> for NewJobRow {
 pub enum EnqueueResult {
     Inserted(JobRow),
     Existing(JobRow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobStatusCount {
+    pub status: String,
+    pub count: i64,
+}
+
+#[derive(Debug, QueryableByName)]
+struct JobStatusCountRow {
+    #[diesel(sql_type = Text)]
+    status: String,
+    #[diesel(sql_type = BigInt)]
+    count: i64,
 }
 
 #[derive(Clone)]
@@ -278,6 +296,38 @@ impl JobRepository {
                 jobs::created_at.asc(),
             ))
             .load(&mut conn)
+    }
+
+    pub fn status_counts(
+        &self,
+        chain_id: Option<i64>,
+        source_id: Option<Uuid>,
+        job_type: Option<JobType>,
+    ) -> QueryResult<Vec<JobStatusCount>> {
+        let mut conn = self.connection()?;
+        let job_type = job_type.map(|value| value.to_string());
+
+        diesel::sql_query(
+            "SELECT status, COUNT(*)::bigint AS count
+             FROM jobs
+             WHERE ($1::bigint IS NULL OR chain_id = $1)
+               AND ($2::uuid IS NULL OR source_id = $2)
+               AND ($3::text IS NULL OR job_type = $3)
+             GROUP BY status
+             ORDER BY status",
+        )
+        .bind::<Nullable<BigInt>, _>(chain_id)
+        .bind::<Nullable<SqlUuid>, _>(source_id)
+        .bind::<Nullable<Text>, _>(job_type)
+        .load::<JobStatusCountRow>(&mut conn)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| JobStatusCount {
+                    status: row.status,
+                    count: row.count,
+                })
+                .collect()
+        })
     }
 
     pub fn attempts_for_job(&self, job_id: Uuid) -> QueryResult<Vec<JobAttemptRow>> {

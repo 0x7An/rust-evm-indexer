@@ -18,7 +18,7 @@ use indexer_rs::{
             schema::{chains, events, jobs, ledger_entries, sources, token_balances},
         },
     },
-    worker::{IngestWorker, WorkerOutcome},
+    worker::{IngestWorker, WorkerOutcome, WorkerRunStopReason},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -197,6 +197,83 @@ async fn worker_returns_no_job_when_queue_is_empty() {
     assert!(matches!(outcome, WorkerOutcome::NoJob));
 }
 
+#[tokio::test]
+async fn worker_runs_until_queue_is_idle() {
+    let ctx = setup();
+    let rpc_url = start_fake_rpc(ctx.contract.clone()).await;
+    ctx.repositories
+        .ledger()
+        .ensure_chain(
+            &format!("worker-loop-test-chain-{}", ctx.chain_id),
+            ctx.chain_id,
+            "<test>",
+            12,
+        )
+        .expect("ensure chain");
+    let source = ctx
+        .repositories
+        .ledger()
+        .ensure_source(
+            ctx.chain_id,
+            "worker-loop-test-source",
+            &ctx.contract,
+            TokenStandard::Erc721,
+            100,
+        )
+        .expect("ensure source");
+
+    for block in [100, 101] {
+        ctx.repositories
+            .jobs()
+            .enqueue(
+                NewJob::new(
+                    JobType::IngestRange,
+                    ctx.chain_id,
+                    format!("it:worker-loop:{}:{block}:{block}", source.id),
+                )
+                .with_source(source.id)
+                .with_range(block, block),
+            )
+            .expect("enqueue ingest job");
+    }
+
+    let worker = IngestWorker::new(
+        ctx.repositories.clone(),
+        EvmRpcClient::new(rpc_url),
+        "worker-loop-it",
+        Duration::seconds(60),
+        10,
+    )
+    .with_chain_id(ctx.chain_id);
+    let summary = worker
+        .run_until_idle(None)
+        .await
+        .expect("run worker until idle");
+
+    assert_eq!(summary.processed_jobs, 2);
+    assert_eq!(summary.failed_jobs, 0);
+    assert_eq!(summary.stop_reason, WorkerRunStopReason::Idle);
+
+    let jobs = ctx
+        .repositories
+        .jobs()
+        .jobs_for_source(source.id)
+        .expect("load source jobs");
+    assert_eq!(jobs.len(), 2);
+    assert!(
+        jobs.iter()
+            .all(|job| job.status == JobStatus::Succeeded.to_string())
+    );
+
+    let checkpoint = ctx
+        .repositories
+        .ledger()
+        .checkpoint_for_source(source.id)
+        .expect("load checkpoint")
+        .expect("checkpoint exists");
+    assert_eq!(checkpoint.processed_block, 101);
+}
+
 async fn start_fake_rpc(contract: String) -> String {
     let state = FakeRpcState {
         contract: Arc::new(contract),
@@ -225,6 +302,7 @@ struct FakeRpcState {
 struct JsonRpcRequest {
     id: Value,
     method: String,
+    params: Value,
 }
 
 async fn fake_rpc_handler(
@@ -237,7 +315,10 @@ async fn fake_rpc_handler(
         "eth_getBlockByNumber" => json!({
             "hash": format!("0x{}", "ef".repeat(32)),
         }),
-        "eth_getLogs" => json!([erc721_transfer_log(&state.contract)]),
+        "eth_getLogs" => json!([erc721_transfer_log(
+            &state.contract,
+            requested_from_block(&request.params)
+        )]),
         _ => {
             return Json(json!({
                 "jsonrpc": "2.0",
@@ -257,7 +338,7 @@ async fn fake_rpc_handler(
     }))
 }
 
-fn erc721_transfer_log(contract: &str) -> Value {
+fn erc721_transfer_log(contract: &str, block_number: u64) -> Value {
     json!({
         "address": contract,
         "topics": [
@@ -267,11 +348,21 @@ fn erc721_transfer_log(contract: &str) -> Value {
             format!("0x{:064x}", 42),
         ],
         "data": "0x",
-        "blockNumber": "0x64",
-        "transactionHash": format!("0x{}", "ab".repeat(32)),
+        "blockNumber": format!("0x{block_number:x}"),
+        "transactionHash": format!("0x{block_number:064x}"),
         "logIndex": "0x0",
-        "blockHash": format!("0x{}", "cd".repeat(32)),
+        "blockHash": format!("0x{:064x}", block_number + 1),
     })
+}
+
+fn requested_from_block(params: &Value) -> u64 {
+    params
+        .get(0)
+        .and_then(|filter| filter.get("fromBlock"))
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix("0x"))
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+        .expect("eth_getLogs fromBlock")
 }
 
 fn topic_address_word(byte: &str) -> String {
