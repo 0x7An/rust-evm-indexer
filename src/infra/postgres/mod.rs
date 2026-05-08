@@ -6,6 +6,7 @@
 
 pub mod connection;
 pub mod job_repository;
+pub mod ledger_repository;
 pub mod models;
 pub mod repositories;
 pub mod schema;

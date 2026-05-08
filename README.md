@@ -82,7 +82,7 @@ This repository is intended to grow through small, reviewable checkpoints:
 2. Domain model and tests
 3. Diesel schema and migrations
 4. Job leasing
-5. Token event decoder with fixtures
+5. Live token event scanner
 6. Ingest worker
 7. Ledger queries and API
 8. Replay and backfill
@@ -92,7 +92,7 @@ Each checkpoint should keep the project buildable, include focused validation, a
 
 ## Current Status
 
-Checkpoint 4 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, and durable job leasing repository tests. Real RPC, API, worker execution, and runtime migration commands will be introduced in later checkpoints.
+Checkpoint 5 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, and a live `scan-contract` CLI that fetches ERC-20, ERC-721, or ERC-1155 transfer logs from an EVM RPC endpoint and persists a ledger slice. API, worker execution, replay, and observability will be introduced in later checkpoints.
 
 ## Development
 
@@ -127,3 +127,64 @@ DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs diesel migrati
 
 The local credentials are for development only. Use real secrets outside local
 development.
+
+## Live Contract Scan
+
+Set `EVM_RPC_URL` locally instead of committing provider credentials:
+
+```sh
+export DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs
+export EVM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/your-api-key
+```
+
+Scan an Ethereum ERC-721 contract:
+
+```sh
+cargo run -- scan-contract \
+  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
+  --standard erc721 \
+  --lookback 5000 \
+  --chunk-size 10
+```
+
+Scan a Polygon ERC-1155 contract:
+
+```sh
+export EVM_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/your-api-key
+
+cargo run -- scan-contract \
+  --chain-name polygon-mainnet \
+  --chain-id 137 \
+  --finality-confirmations 256 \
+  --contract 0x2953399124f0cbb46d2cbacd8a89cf0599974963 \
+  --standard erc1155 \
+  --lookback 5000 \
+  --chunk-size 10
+```
+
+For repeatable checks, use explicit finalized block ranges:
+
+```sh
+cargo run -- scan-contract \
+  --chain-name polygon-mainnet \
+  --chain-id 137 \
+  --finality-confirmations 256 \
+  --contract 0x2953399124f0cbb46d2cbacd8a89cf0599974963 \
+  --standard erc1155 \
+  --from-block 0x528e895 \
+  --to-block 0x528e895 \
+  --chunk-size 10
+```
+
+Ethereum ERC-721 repeatable example:
+
+```sh
+cargo run -- scan-contract \
+  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
+  --standard erc721 \
+  --from-block 19700000 \
+  --to-block 19701000 \
+  --chunk-size 10
+```
+
+The default chunk size is 10 blocks so the command works with RPC providers that tightly limit `eth_getLogs` ranges. Increase `--chunk-size` when your provider plan allows wider log queries. The default `latest` end block resolves to `head - finality_confirmations`, and the command verifies that the contract has bytecode on the selected chain before printing decoded log counts, persisted ledger entries, minters, and current holders for the indexed block slice.

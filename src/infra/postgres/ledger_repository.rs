@@ -1,0 +1,393 @@
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
+use bigdecimal::{BigDecimal, Zero};
+use diesel::{PgConnection, prelude::*, upsert::excluded};
+use serde_json::json;
+use uuid::Uuid;
+
+use crate::infra::evm::decoder::{DecodedLog, RpcLog, TokenStandard, parse_hex_u64};
+
+use super::{
+    connection::PgPool,
+    models::{
+        ChainRow, LedgerEntryRow, NewChainRow, NewEventRow, NewLedgerEntryRow, NewSourceRow,
+        NewTokenBalanceRow, SourceRow, TokenBalanceRow,
+    },
+    schema::{chains, events, ledger_entries, sources, token_balances},
+};
+
+#[derive(Debug, Clone)]
+pub struct ScanSummary {
+    pub source_id: Uuid,
+    pub events_seen: usize,
+    pub events_persisted: usize,
+    pub ledger_entries_persisted: usize,
+    pub holder_count: i64,
+    pub minter_count: i64,
+    pub top_holders: Vec<TokenBalanceRow>,
+}
+
+#[derive(Clone)]
+pub struct LedgerRepository {
+    pool: PgPool,
+}
+
+impl LedgerRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub fn ensure_chain(
+        &self,
+        name: &str,
+        chain_id: i64,
+        rpc_url: &str,
+        finality_confirmations: i64,
+    ) -> Result<ChainRow> {
+        let mut conn = self.connection()?;
+        diesel::insert_into(chains::table)
+            .values(NewChainRow {
+                name: name.to_string(),
+                chain_id,
+                rpc_url: rpc_url.to_string(),
+                finality_confirmations,
+            })
+            .on_conflict(chains::chain_id)
+            .do_update()
+            .set((
+                chains::name.eq(name),
+                chains::rpc_url.eq(rpc_url),
+                chains::finality_confirmations.eq(finality_confirmations),
+            ))
+            .get_result(&mut conn)
+            .context("upsert chain")
+    }
+
+    pub fn ensure_source(
+        &self,
+        chain_id: i64,
+        name: &str,
+        contract_address: &str,
+        standard: TokenStandard,
+        start_block: i64,
+    ) -> Result<SourceRow> {
+        let mut conn = self.connection()?;
+        diesel::insert_into(sources::table)
+            .values(NewSourceRow {
+                id: Uuid::new_v4(),
+                chain_id,
+                name: name.to_string(),
+                contract_address: contract_address.to_ascii_lowercase(),
+                token_standard: standard.as_str().to_string(),
+                event_signatures: match standard {
+                    TokenStandard::Erc20 | TokenStandard::Erc721 => {
+                        json!(["Transfer(address,address,uint256)"])
+                    }
+                    TokenStandard::Erc1155 => {
+                        json!([
+                            "TransferSingle(address,address,address,uint256,uint256)",
+                            "TransferBatch(address,address,address,uint256[],uint256[])"
+                        ])
+                    }
+                },
+                start_block,
+                enabled: true,
+            })
+            .on_conflict((sources::chain_id, sources::contract_address))
+            .do_update()
+            .set((
+                sources::name.eq(name),
+                sources::token_standard.eq(standard.as_str()),
+                sources::event_signatures.eq(excluded(sources::event_signatures)),
+                sources::start_block.eq(start_block),
+                sources::enabled.eq(true),
+            ))
+            .get_result(&mut conn)
+            .context("upsert source")
+    }
+
+    pub fn persist_decoded_logs(
+        &self,
+        source: &SourceRow,
+        logs: &[(RpcLog, DecodedLog)],
+    ) -> Result<ScanSummary> {
+        let mut conn = self.connection()?;
+        conn.transaction::<ScanSummary, anyhow::Error, _>(|conn| {
+            let mut events_persisted = 0;
+            let mut ledger_entries_persisted = 0;
+
+            for (log, decoded) in logs {
+                let event_id = self.upsert_event(conn, source, log, decoded)?;
+                events_persisted += 1;
+
+                for entry in &decoded.entries {
+                    self.upsert_ledger_entry(conn, source, log, event_id, entry)?;
+                    ledger_entries_persisted += 1;
+                }
+            }
+
+            self.rebuild_balances(conn, source)?;
+            let holder_count = self.holder_count_conn(conn, source.id)?;
+            let minter_count = self.minter_count_conn(conn, source.id)?;
+            let top_holders = self.top_holders_conn(conn, source.id, 10)?;
+
+            Ok(ScanSummary {
+                source_id: source.id,
+                events_seen: logs.len(),
+                events_persisted,
+                ledger_entries_persisted,
+                holder_count,
+                minter_count,
+                top_holders,
+            })
+        })
+        .context("persist decoded logs")
+    }
+
+    fn upsert_event(
+        &self,
+        conn: &mut PgConnection,
+        source: &SourceRow,
+        log: &RpcLog,
+        decoded: &DecodedLog,
+    ) -> Result<Uuid> {
+        let row = diesel::insert_into(events::table)
+            .values(NewEventRow {
+                id: Uuid::new_v4(),
+                source_id: source.id,
+                chain_id: source.chain_id,
+                block_number: parse_hex_u64(&log.block_number)? as i64,
+                block_hash: log.block_hash.to_ascii_lowercase(),
+                transaction_hash: log.transaction_hash.to_ascii_lowercase(),
+                log_index: parse_hex_u64(&log.log_index)? as i32,
+                contract_address: log.address.to_ascii_lowercase(),
+                event_name: decoded.event_name.clone(),
+                args: json!({
+                    "entries": decoded.entries.iter().map(|entry| {
+                        json!({
+                            "event_name": entry.event_name,
+                            "token_standard": entry.token_standard.as_str(),
+                            "operator": entry.operator,
+                            "from": entry.from,
+                            "to": entry.to,
+                            "token_id": entry.token_id,
+                            "amount": entry.amount,
+                            "batch_index": entry.batch_index,
+                        })
+                    }).collect::<Vec<_>>()
+                }),
+                finalized: true,
+                orphaned: false,
+            })
+            .on_conflict((
+                events::chain_id,
+                events::transaction_hash,
+                events::log_index,
+            ))
+            .do_update()
+            .set((
+                events::args.eq(excluded(events::args)),
+                events::finalized.eq(true),
+                events::orphaned.eq(false),
+            ))
+            .get_result::<super::models::EventRow>(conn)
+            .context("upsert event")?;
+
+        Ok(row.id)
+    }
+
+    fn upsert_ledger_entry(
+        &self,
+        conn: &mut PgConnection,
+        source: &SourceRow,
+        log: &RpcLog,
+        event_id: Uuid,
+        entry: &crate::infra::evm::decoder::DecodedLedgerEntry,
+    ) -> Result<Uuid> {
+        let amount = entry
+            .amount
+            .parse::<BigDecimal>()
+            .with_context(|| format!("parse amount {}", entry.amount))?;
+        let movement_type = movement_type(&entry.from, &entry.to);
+
+        let row = diesel::insert_into(ledger_entries::table)
+            .values(NewLedgerEntryRow {
+                id: Uuid::new_v4(),
+                event_id,
+                source_id: source.id,
+                chain_id: source.chain_id,
+                contract_address: log.address.to_ascii_lowercase(),
+                token_standard: entry.token_standard.as_str().to_string(),
+                movement_type: movement_type.to_string(),
+                operator_address: entry
+                    .operator
+                    .as_ref()
+                    .map(|value| value.to_ascii_lowercase()),
+                from_address: non_zero_address(&entry.from),
+                to_address: non_zero_address(&entry.to),
+                token_id: entry.token_id.clone(),
+                amount,
+                batch_index: entry.batch_index,
+                block_number: parse_hex_u64(&log.block_number)? as i64,
+                block_hash: log.block_hash.to_ascii_lowercase(),
+                transaction_hash: log.transaction_hash.to_ascii_lowercase(),
+                log_index: parse_hex_u64(&log.log_index)? as i32,
+                orphaned: false,
+            })
+            .on_conflict((
+                ledger_entries::chain_id,
+                ledger_entries::transaction_hash,
+                ledger_entries::log_index,
+                ledger_entries::batch_index,
+            ))
+            .do_update()
+            .set((
+                ledger_entries::amount.eq(excluded(ledger_entries::amount)),
+                ledger_entries::orphaned.eq(false),
+            ))
+            .get_result::<LedgerEntryRow>(conn)
+            .context("upsert ledger entry")?;
+
+        Ok(row.id)
+    }
+
+    fn rebuild_balances(&self, conn: &mut PgConnection, source: &SourceRow) -> Result<()> {
+        let rows = ledger_entries::table
+            .filter(ledger_entries::source_id.eq(source.id))
+            .filter(ledger_entries::orphaned.eq(false))
+            .order((
+                ledger_entries::block_number.asc(),
+                ledger_entries::log_index.asc(),
+                ledger_entries::batch_index.asc(),
+            ))
+            .load::<LedgerEntryRow>(conn)
+            .context("load ledger entries for balance rebuild")?;
+
+        diesel::delete(token_balances::table.filter(token_balances::source_id.eq(source.id)))
+            .execute(conn)
+            .context("delete previous token balances")?;
+
+        let mut balances: HashMap<(String, String), BalanceAccumulator> = HashMap::new();
+
+        for row in rows {
+            if let Some(from) = row.from_address {
+                let key = (from, row.token_id.clone());
+                let entry = balances.entry(key).or_default();
+                entry.balance -= row.amount.clone();
+                entry.last_moved_block = Some(row.block_number);
+            }
+
+            if let Some(to) = row.to_address {
+                let key = (to, row.token_id.clone());
+                let entry = balances.entry(key).or_default();
+                entry.balance += row.amount.clone();
+                entry.first_received_block.get_or_insert(row.block_number);
+                entry.last_moved_block = Some(row.block_number);
+            }
+        }
+
+        let rows = balances
+            .into_iter()
+            .filter(|(_, value)| value.balance > BigDecimal::zero())
+            .map(|((holder_address, token_id), value)| NewTokenBalanceRow {
+                id: Uuid::new_v4(),
+                source_id: source.id,
+                chain_id: source.chain_id,
+                contract_address: source.contract_address.clone(),
+                token_standard: source.token_standard.clone(),
+                holder_address,
+                token_id,
+                balance: value.balance,
+                first_received_block: value.first_received_block,
+                last_moved_block: value.last_moved_block,
+            })
+            .collect::<Vec<_>>();
+
+        if !rows.is_empty() {
+            diesel::insert_into(token_balances::table)
+                .values(rows)
+                .execute(conn)
+                .context("insert rebuilt token balances")?;
+        }
+
+        Ok(())
+    }
+
+    fn holder_count_conn(&self, conn: &mut PgConnection, source_id: Uuid) -> Result<i64> {
+        token_balances::table
+            .filter(token_balances::source_id.eq(source_id))
+            .filter(token_balances::balance.gt(BigDecimal::zero()))
+            .count()
+            .get_result(conn)
+            .context("count holders")
+    }
+
+    fn minter_count_conn(&self, conn: &mut PgConnection, source_id: Uuid) -> Result<i64> {
+        let minters = ledger_entries::table
+            .filter(ledger_entries::source_id.eq(source_id))
+            .filter(ledger_entries::movement_type.eq("mint"))
+            .filter(ledger_entries::orphaned.eq(false))
+            .select(ledger_entries::to_address)
+            .distinct()
+            .load::<Option<String>>(conn)
+            .context("load distinct minters")?;
+
+        Ok(minters.into_iter().flatten().count() as i64)
+    }
+
+    fn top_holders_conn(
+        &self,
+        conn: &mut PgConnection,
+        source_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<TokenBalanceRow>> {
+        token_balances::table
+            .filter(token_balances::source_id.eq(source_id))
+            .filter(token_balances::balance.gt(BigDecimal::zero()))
+            .order(token_balances::balance.desc())
+            .limit(limit)
+            .load(conn)
+            .context("load top holders")
+    }
+
+    fn connection(
+        &self,
+    ) -> Result<diesel::r2d2::PooledConnection<diesel::r2d2::ConnectionManager<PgConnection>>> {
+        self.pool.get().context("get postgres connection")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BalanceAccumulator {
+    balance: BigDecimal,
+    first_received_block: Option<i64>,
+    last_moved_block: Option<i64>,
+}
+
+impl Default for BalanceAccumulator {
+    fn default() -> Self {
+        Self {
+            balance: BigDecimal::zero(),
+            first_received_block: None,
+            last_moved_block: None,
+        }
+    }
+}
+
+fn non_zero_address(value: &str) -> Option<String> {
+    let value = value.to_ascii_lowercase();
+    (value != "0x0000000000000000000000000000000000000000").then_some(value)
+}
+
+fn movement_type(from: &str, to: &str) -> &'static str {
+    match (
+        non_zero_address(from).is_some(),
+        non_zero_address(to).is_some(),
+    ) {
+        (false, true) => "mint",
+        (true, false) => "burn",
+        (true, true) => "transfer",
+        (false, false) => "transfer",
+    }
+}
