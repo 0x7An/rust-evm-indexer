@@ -750,9 +750,9 @@ impl LedgerRepository {
             })
             .collect::<Vec<_>>();
 
-        if !rows.is_empty() {
+        for chunk in rows.chunks(TOKEN_BALANCE_INSERT_CHUNK_SIZE) {
             diesel::insert_into(token_balances::table)
-                .values(rows)
+                .values(chunk)
                 .execute(conn)
                 .context("insert rebuilt token balances")?;
         }
@@ -1012,3 +1012,5 @@ fn movement_type(from: &str, to: &str) -> &'static str {
         (false, false) => "transfer",
     }
 }
+
+const TOKEN_BALANCE_INSERT_CHUNK_SIZE: usize = 1_000;
