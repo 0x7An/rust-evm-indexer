@@ -4,4 +4,5 @@
 //! replaying ranges, and verifying reorgs. Infrastructure implements the
 //! ports defined here in later checkpoints.
 
+pub mod backfill;
 pub mod ingest;

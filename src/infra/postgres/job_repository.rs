@@ -268,6 +268,18 @@ impl JobRepository {
         jobs::table.filter(jobs::id.eq(job_id)).first(&mut conn)
     }
 
+    pub fn jobs_for_source(&self, source_id: Uuid) -> QueryResult<Vec<JobRow>> {
+        let mut conn = self.connection()?;
+        jobs::table
+            .filter(jobs::source_id.eq(Some(source_id)))
+            .order((
+                jobs::from_block.asc(),
+                jobs::to_block.asc(),
+                jobs::created_at.asc(),
+            ))
+            .load(&mut conn)
+    }
+
     pub fn attempts_for_job(&self, job_id: Uuid) -> QueryResult<Vec<JobAttemptRow>> {
         let mut conn = self.connection()?;
         job_attempts::table

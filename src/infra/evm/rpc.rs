@@ -40,6 +40,21 @@ impl EvmRpcClient {
             .ok_or_else(|| anyhow::anyhow!("eth_getCode result was not a string"))
     }
 
+    pub async fn block_hash(&self, block: u64) -> Result<String> {
+        let value = self
+            .call(
+                "eth_getBlockByNumber",
+                json!([format!("0x{block:x}"), false]),
+            )
+            .await?;
+
+        value
+            .get("hash")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| anyhow::anyhow!("eth_getBlockByNumber result missing hash"))
+    }
+
     pub async fn logs(
         &self,
         contract_address: &str,

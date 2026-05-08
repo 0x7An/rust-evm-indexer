@@ -92,6 +92,8 @@ async fn exposes_summary_holders_minters_transfers_and_token_path() {
     assert_eq!(summary["minter_count"], 2);
     assert_eq!(summary["first_indexed_block"], 100);
     assert_eq!(summary["last_indexed_block"], 102);
+    assert_eq!(summary["checkpoint_processed_block"], 102);
+    assert_eq!(summary["checkpoint_finalized_block"], 110);
 
     let holders_uri = format!(
         "/chains/{}/contracts/{}/holders?limit=10",
@@ -240,6 +242,10 @@ fn seed_ledger(pool: PgPool, chain_id: i64, contract: &str) {
     LedgerRepository::new(repositories.pool().clone())
         .persist_decoded_logs(&source, &logs)
         .expect("persist decoded test logs");
+    repositories
+        .ledger()
+        .advance_checkpoint(source.id, 102, &format!("0x{}", "bb".repeat(32)), 110)
+        .expect("insert test checkpoint");
 }
 
 fn transfer_log(
@@ -287,6 +293,15 @@ fn cleanup_chain(conn: &mut PgConnection, chain_id: i64) {
     diesel::delete(events::table.filter(events::chain_id.eq(chain_id)))
         .execute(conn)
         .expect("delete test events");
+    diesel::sql_query(
+        "DELETE FROM checkpoints
+         USING sources
+         WHERE checkpoints.source_id = sources.id
+           AND sources.chain_id = $1",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(chain_id)
+    .execute(conn)
+    .expect("delete test checkpoints");
     diesel::delete(sources::table.filter(sources::chain_id.eq(chain_id)))
         .execute(conn)
         .expect("delete test sources");

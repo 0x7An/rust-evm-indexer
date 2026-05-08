@@ -163,6 +163,21 @@ async fn worker_processes_queued_ingest_job() {
     assert_eq!(contract_summary.event_count, 1);
     assert_eq!(contract_summary.ledger_entry_count, 1);
     assert_eq!(contract_summary.holder_count, 1);
+    assert_eq!(contract_summary.checkpoint_processed_block, Some(100));
+    assert_eq!(contract_summary.checkpoint_finalized_block, Some(100));
+
+    let checkpoint = ctx
+        .repositories
+        .ledger()
+        .checkpoint_for_source(source.id)
+        .expect("load checkpoint")
+        .expect("checkpoint exists");
+    assert_eq!(checkpoint.processed_block, 100);
+    assert_eq!(
+        checkpoint.processed_block_hash,
+        format!("0x{}", "ef".repeat(32))
+    );
+    assert_eq!(checkpoint.finalized_block, 100);
 }
 
 #[tokio::test]
@@ -219,6 +234,9 @@ async fn fake_rpc_handler(
     let result = match request.method.as_str() {
         "eth_blockNumber" => json!("0x70"),
         "eth_getCode" => json!("0x6000"),
+        "eth_getBlockByNumber" => json!({
+            "hash": format!("0x{}", "ef".repeat(32)),
+        }),
         "eth_getLogs" => json!([erc721_transfer_log(&state.contract)]),
         _ => {
             return Json(json!({
@@ -282,6 +300,15 @@ fn cleanup_chain(conn: &mut PgConnection, chain_id: i64) {
     diesel::delete(jobs::table.filter(jobs::chain_id.eq(chain_id)))
         .execute(conn)
         .expect("delete test jobs");
+    diesel::sql_query(
+        "DELETE FROM checkpoints
+         USING sources
+         WHERE checkpoints.source_id = sources.id
+           AND sources.chain_id = $1",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(chain_id)
+    .execute(conn)
+    .expect("delete test checkpoints");
     diesel::delete(sources::table.filter(sources::chain_id.eq(chain_id)))
         .execute(conn)
         .expect("delete test sources");

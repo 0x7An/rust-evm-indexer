@@ -5,8 +5,9 @@ use chrono::Duration;
 use clap::{Parser, Subcommand};
 use indexer_rs::{
     api,
-    application::ingest::{
-        ingest_source_range, normalize_address, redact_rpc_url, resolve_finalized_range,
+    application::{
+        backfill::{BackfillPlan, plan_backfill_jobs},
+        ingest::{ingest_source_range, normalize_address, redact_rpc_url, resolve_finalized_range},
     },
     domain::job::JobType,
     infra::{
@@ -33,11 +34,11 @@ enum Commands {
     /// Fetch standard token logs for a contract and persist a ledger slice.
     ScanContract {
         /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
-        #[arg(long, env = "EVM_RPC_URL")]
+        #[arg(long, env = "EVM_RPC_URL", hide_env_values = true)]
         rpc_url: Option<String>,
 
         /// Postgres database URL. Prefer DATABASE_URL for local use.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
 
         /// Chain display name to persist with the source.
@@ -80,11 +81,11 @@ enum Commands {
     /// Enqueue a durable ingestion job for a contract range.
     EnqueueContract {
         /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
-        #[arg(long, env = "EVM_RPC_URL")]
+        #[arg(long, env = "EVM_RPC_URL", hide_env_values = true)]
         rpc_url: Option<String>,
 
         /// Postgres database URL. Prefer DATABASE_URL for local use.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
 
         /// Chain display name to persist with the source.
@@ -124,10 +125,61 @@ enum Commands {
         max_attempts: i32,
     },
 
+    /// Plan a contract backfill as deterministic durable ingestion jobs.
+    BackfillContract {
+        /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
+        #[arg(long, env = "EVM_RPC_URL", hide_env_values = true)]
+        rpc_url: Option<String>,
+
+        /// Postgres database URL. Prefer DATABASE_URL for local use.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+
+        /// Chain display name to persist with the source.
+        #[arg(long, default_value = "ethereum-mainnet")]
+        chain_name: String,
+
+        /// EVM chain id to persist with the source.
+        #[arg(long, default_value_t = 1)]
+        chain_id: i64,
+
+        /// Finality confirmations to persist with the chain metadata.
+        #[arg(long, default_value_t = 64)]
+        finality_confirmations: i64,
+
+        /// Contract address to backfill.
+        #[arg(long)]
+        contract: String,
+
+        /// Token standard: erc20, erc721, or erc1155.
+        #[arg(long)]
+        standard: String,
+
+        /// Inclusive start block. Defaults to to-block minus lookback.
+        #[arg(long)]
+        from_block: Option<String>,
+
+        /// Inclusive end block. Use a decimal block, hex block, or finalized latest.
+        #[arg(long, default_value = "latest")]
+        to_block: String,
+
+        /// Number of recent blocks to plan when from-block is omitted.
+        #[arg(long, default_value_t = 5_000)]
+        lookback: u64,
+
+        /// Maximum inclusive block span per durable ingestion job.
+        #[arg(long, default_value_t = 100)]
+        range_size: u64,
+
+        /// Maximum attempts before each job is dead-lettered.
+        #[arg(long, default_value_t = 5)]
+        max_attempts: i32,
+    },
+
     /// Run the HTTP read API for indexed ledger data.
     Serve {
         /// Postgres database URL. Prefer DATABASE_URL for local use.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
 
         /// Socket address to bind.
@@ -147,11 +199,11 @@ enum WorkerCommands {
     /// Lease and execute at most one queued ingestion job.
     RunOnce {
         /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
-        #[arg(long, env = "EVM_RPC_URL")]
+        #[arg(long, env = "EVM_RPC_URL", hide_env_values = true)]
         rpc_url: Option<String>,
 
         /// Postgres database URL. Prefer DATABASE_URL for local use.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
 
         /// Stable worker id recorded in job attempts.
@@ -234,6 +286,38 @@ async fn main() -> Result<()> {
                 from_block,
                 to_block,
                 lookback,
+                max_attempts,
+            )
+            .await
+        }
+        Commands::BackfillContract {
+            rpc_url,
+            database_url,
+            chain_name,
+            chain_id,
+            finality_confirmations,
+            contract,
+            standard,
+            from_block,
+            to_block,
+            lookback,
+            range_size,
+            max_attempts,
+        } => {
+            let rpc_url = rpc_url_from_args(rpc_url)?;
+
+            backfill_contract(
+                rpc_url,
+                database_url,
+                chain_name,
+                chain_id,
+                finality_confirmations,
+                contract,
+                standard,
+                from_block,
+                to_block,
+                lookback,
+                range_size,
                 max_attempts,
             )
             .await
@@ -456,6 +540,89 @@ async fn enqueue_contract(
     Ok(())
 }
 
+async fn backfill_contract(
+    rpc_url: String,
+    database_url: String,
+    chain_name: String,
+    chain_id: i64,
+    finality_confirmations: i64,
+    contract: String,
+    standard: String,
+    from_block: Option<String>,
+    to_block: String,
+    lookback: u64,
+    range_size: u64,
+    max_attempts: i32,
+) -> Result<()> {
+    let standard = standard
+        .parse::<TokenStandard>()
+        .with_context(|| format!("parse token standard {standard}"))?;
+    let contract = normalize_address(&contract)?;
+    if chain_id <= 0 {
+        bail!("chain-id must be greater than zero");
+    }
+    if range_size == 0 {
+        bail!("range-size must be greater than zero");
+    }
+    if max_attempts <= 0 {
+        bail!("max-attempts must be greater than zero");
+    }
+
+    let rpc = EvmRpcClient::new(&rpc_url);
+    let range = resolve_finalized_range(
+        &rpc,
+        from_block.as_deref(),
+        &to_block,
+        lookback,
+        finality_confirmations,
+    )
+    .await?;
+    let code = rpc
+        .code_at(&contract, range.to)
+        .await
+        .with_context(|| format!("fetch contract code at block {}", range.to))?;
+    if code == "0x" {
+        bail!(
+            "no contract code at {contract} on {chain_name} ({chain_id}) at block {}",
+            range.to
+        );
+    }
+
+    let pool = build_pool(&database_url).context("build postgres pool")?;
+    let repositories = PostgresRepositories::new(pool);
+    repositories
+        .ledger()
+        .ensure_chain(
+            &chain_name,
+            chain_id,
+            &redact_rpc_url(&rpc_url),
+            finality_confirmations,
+        )
+        .context("ensure chain")?;
+    let source = repositories
+        .ledger()
+        .ensure_source(
+            chain_id,
+            &format!("{}-{contract}", standard.as_str()),
+            &contract,
+            standard,
+            range.from as i64,
+        )
+        .context("ensure source")?;
+
+    let plan = plan_backfill_jobs(
+        &repositories,
+        &source,
+        range.from,
+        range.to,
+        range_size,
+        max_attempts,
+    )?;
+    print_backfill_plan(&source.contract_address, &chain_name, chain_id, &plan);
+
+    Ok(())
+}
+
 async fn worker_run_once(
     rpc_url: String,
     database_url: String,
@@ -503,6 +670,26 @@ async fn worker_run_once(
     }
 
     Ok(())
+}
+
+fn print_backfill_plan(contract: &str, chain_name: &str, chain_id: i64, plan: &BackfillPlan) {
+    println!(
+        "Backfill plan for {contract} on {chain_name} ({chain_id}) requested blocks {from}..={to}.",
+        from = plan.requested_from,
+        to = plan.requested_to
+    );
+
+    match (plan.planned_from, plan.planned_to) {
+        (Some(from), Some(to)) => println!(
+            "Jobs cover blocks {from}..={to} in {jobs} ranges of up to {range_size} blocks.",
+            jobs = plan.total_jobs(),
+            range_size = plan.range_size
+        ),
+        _ => println!("No new jobs needed; the checkpoint already covers the requested range."),
+    }
+
+    println!("Inserted jobs: {}", plan.inserted_jobs);
+    println!("Existing jobs: {}", plan.existing_jobs);
 }
 
 fn print_scan_summary(summary: &indexer_rs::infra::postgres::ledger_repository::ScanSummary) {

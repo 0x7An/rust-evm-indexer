@@ -85,14 +85,15 @@ This repository is intended to grow through small, reviewable checkpoints:
 5. Live token event scanner
 6. Ledger query API
 7. Ingest worker
-8. Replay and backfill
-9. Observability and doctor CLI
+8. Contract backfill planning and checkpoints
+9. Replay and reorg handling
+10. Observability and doctor CLI
 
 Each checkpoint should keep the project buildable, include focused validation, and produce a clear commit/PR boundary.
 
 ## Current Status
 
-Checkpoint 7 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, durable ingest job enqueueing, a worker that leases and executes ingestion jobs, and a read API for querying indexed ledger slices. Replay and observability will be introduced in later checkpoints.
+Checkpoint 8 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that leases and executes ingestion jobs, source checkpoints, and a read API for querying indexed ledger slices. Replay/reorg handling and observability will be introduced in later checkpoints.
 
 ## Development
 
@@ -222,6 +223,22 @@ cargo run -- worker run-once \
 
 `enqueue-contract` resolves the finalized range, verifies contract bytecode, creates or updates the source, and inserts an idempotent `INGEST_RANGE` job. `worker run-once` leases the next available ingest job, optionally restricted by `--chain-id`, marks it running, executes the same decoder/persistence path as `scan-contract`, and marks the job succeeded or failed.
 
+For larger ranges, plan a resumable backfill. This splits the requested finalized range into deterministic `INGEST_RANGE` jobs and skips ranges that are already covered by the source checkpoint:
+
+```sh
+cargo run -- backfill-contract \
+  --chain-name polygon-mainnet \
+  --chain-id 137 \
+  --finality-confirmations 256 \
+  --contract 0x2953399124f0cbb46d2cbacd8a89cf0599974963 \
+  --standard erc1155 \
+  --from-block 0x528e895 \
+  --to-block latest \
+  --range-size 100
+```
+
+Backfill jobs use idempotency keys based on `source_id`, `from_block`, and `to_block`, so rerunning the same command reports existing jobs instead of duplicating work. After a worker successfully ingests a range, it advances the checkpoint only across contiguous completed ranges, so progress does not skip gaps when jobs finish out of order.
+
 ## HTTP API
 
 Start the read API after running migrations and indexing at least one contract:
@@ -242,6 +259,9 @@ Contract summary for an indexed Ethereum ERC-721 slice:
 ```sh
 curl http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/summary
 ```
+
+The summary includes ledger counts plus checkpoint progress fields:
+`checkpoint_processed_block` and `checkpoint_finalized_block`.
 
 Current holders in the indexed slice:
 

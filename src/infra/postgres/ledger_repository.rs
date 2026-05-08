@@ -2,20 +2,24 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use bigdecimal::{BigDecimal, Zero};
+use chrono::Utc;
 use diesel::{PgConnection, prelude::*, upsert::excluded};
 use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::infra::evm::decoder::{DecodedLog, RpcLog, TokenStandard, parse_hex_u64};
+use crate::{
+    domain::job::JobStatus,
+    infra::evm::decoder::{DecodedLog, RpcLog, TokenStandard, parse_hex_u64},
+};
 
 use super::{
     connection::PgPool,
     models::{
-        ChainRow, LedgerEntryRow, NewChainRow, NewEventRow, NewLedgerEntryRow, NewSourceRow,
-        NewTokenBalanceRow, SourceRow, TokenBalanceRow,
+        ChainRow, CheckpointRow, LedgerEntryRow, NewChainRow, NewCheckpointRow, NewEventRow,
+        NewLedgerEntryRow, NewSourceRow, NewTokenBalanceRow, SourceRow, TokenBalanceRow,
     },
-    schema::{chains, events, ledger_entries, sources, token_balances},
+    schema::{chains, checkpoints, events, jobs, ledger_entries, sources, token_balances},
 };
 
 #[derive(Debug, Clone)]
@@ -43,6 +47,8 @@ pub struct ContractSummary {
     pub minter_count: i64,
     pub first_indexed_block: Option<i64>,
     pub last_indexed_block: Option<i64>,
+    pub checkpoint_processed_block: Option<i64>,
+    pub checkpoint_finalized_block: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -211,6 +217,135 @@ impl LedgerRepository {
             .context("load source by id")
     }
 
+    pub fn checkpoint_for_source(&self, source_id: Uuid) -> Result<Option<CheckpointRow>> {
+        let mut conn = self.connection()?;
+        checkpoints::table
+            .filter(checkpoints::source_id.eq(source_id))
+            .first(&mut conn)
+            .optional()
+            .context("load checkpoint by source")
+    }
+
+    pub fn advance_checkpoint(
+        &self,
+        source_id: Uuid,
+        processed_block: i64,
+        processed_block_hash: &str,
+        finalized_block: i64,
+    ) -> Result<CheckpointRow> {
+        if processed_block < 0 {
+            anyhow::bail!("processed block cannot be negative");
+        }
+        if finalized_block < 0 {
+            anyhow::bail!("finalized block cannot be negative");
+        }
+        if processed_block > finalized_block {
+            anyhow::bail!(
+                "processed block {processed_block} cannot be greater than finalized block {finalized_block}"
+            );
+        }
+
+        let mut conn = self.connection()?;
+        conn.transaction::<CheckpointRow, anyhow::Error, _>(|conn| {
+            let existing = checkpoints::table
+                .filter(checkpoints::source_id.eq(source_id))
+                .for_update()
+                .first::<CheckpointRow>(conn)
+                .optional()
+                .context("lock checkpoint")?;
+
+            let Some(existing) = existing else {
+                return diesel::insert_into(checkpoints::table)
+                    .values(NewCheckpointRow {
+                        id: Uuid::new_v4(),
+                        source_id,
+                        processed_block,
+                        processed_block_hash: processed_block_hash.to_ascii_lowercase(),
+                        finalized_block,
+                    })
+                    .get_result(conn)
+                    .context("insert checkpoint");
+            };
+
+            if processed_block < existing.processed_block
+                && finalized_block <= existing.finalized_block
+            {
+                return Ok(existing);
+            }
+
+            let next_processed_block = existing.processed_block.max(processed_block);
+            let next_finalized_block = existing.finalized_block.max(finalized_block);
+            let next_processed_block_hash = if processed_block >= existing.processed_block {
+                processed_block_hash.to_ascii_lowercase()
+            } else {
+                existing.processed_block_hash
+            };
+
+            diesel::update(checkpoints::table.filter(checkpoints::id.eq(existing.id)))
+                .set((
+                    checkpoints::processed_block.eq(next_processed_block),
+                    checkpoints::processed_block_hash.eq(next_processed_block_hash),
+                    checkpoints::finalized_block.eq(next_finalized_block),
+                    checkpoints::updated_at.eq(Utc::now()),
+                ))
+                .get_result(conn)
+                .context("update checkpoint")
+        })
+    }
+
+    pub fn next_contiguous_checkpoint_target(
+        &self,
+        source: &SourceRow,
+        completed_range: Option<(i64, i64)>,
+    ) -> Result<Option<i64>> {
+        if let Some((from, to)) = completed_range {
+            if from < 0 || to < 0 {
+                anyhow::bail!("completed range cannot be negative");
+            }
+            if from > to {
+                anyhow::bail!("completed range {from}..={to} is inverted");
+            }
+        }
+
+        let mut conn = self.connection()?;
+        conn.transaction::<Option<i64>, anyhow::Error, _>(|conn| {
+            let checkpoint = checkpoints::table
+                .filter(checkpoints::source_id.eq(source.id))
+                .for_update()
+                .first::<CheckpointRow>(conn)
+                .optional()
+                .context("lock checkpoint")?;
+            let frontier = checkpoint
+                .as_ref()
+                .map(|row| row.processed_block)
+                .unwrap_or(source.start_block - 1);
+
+            let mut ranges = jobs::table
+                .filter(jobs::source_id.eq(Some(source.id)))
+                .filter(jobs::status.eq(JobStatus::Succeeded.to_string()))
+                .select((jobs::from_block, jobs::to_block))
+                .load::<(Option<i64>, Option<i64>)>(conn)
+                .context("load succeeded ranges for checkpoint")?
+                .into_iter()
+                .filter_map(|(from, to)| Some((from?, to?)))
+                .collect::<Vec<_>>();
+
+            if let Some(range) = completed_range {
+                ranges.push(range);
+            }
+            ranges.sort_unstable();
+
+            let mut target = frontier;
+            for (from, to) in ranges {
+                if from <= target.saturating_add(1) && to > target {
+                    target = to;
+                }
+            }
+
+            Ok((target > frontier).then_some(target))
+        })
+    }
+
     pub fn contract_summary(
         &self,
         chain_id: i64,
@@ -238,6 +373,11 @@ impl LedgerRepository {
         let minter_count = self.minter_count_conn(&mut conn, source.id)?;
         let first_indexed_block = self.first_block_conn(&mut conn, source.id)?;
         let last_indexed_block = self.last_block_conn(&mut conn, source.id)?;
+        let checkpoint = checkpoints::table
+            .filter(checkpoints::source_id.eq(source.id))
+            .first::<CheckpointRow>(&mut conn)
+            .optional()
+            .context("load checkpoint for summary")?;
 
         Ok(Some(ContractSummary {
             source_id: source.id,
@@ -252,6 +392,8 @@ impl LedgerRepository {
             minter_count,
             first_indexed_block,
             last_indexed_block,
+            checkpoint_processed_block: checkpoint.as_ref().map(|row| row.processed_block),
+            checkpoint_finalized_block: checkpoint.as_ref().map(|row| row.finalized_block),
         }))
     }
 

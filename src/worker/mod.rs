@@ -136,7 +136,7 @@ impl IngestWorker {
             );
         }
 
-        ingest_source_range(
+        let summary = ingest_source_range(
             &self.rpc,
             self.repositories.ledger(),
             &source,
@@ -144,7 +144,27 @@ impl IngestWorker {
             to as u64,
             self.chunk_size,
         )
-        .await
+        .await?;
+
+        let mut completed_range = Some((from, to));
+        while let Some(target) = self
+            .repositories
+            .ledger()
+            .next_contiguous_checkpoint_target(&source, completed_range)
+            .context("compute checkpoint target")?
+        {
+            let processed_block_hash =
+                self.rpc.block_hash(target as u64).await.with_context(|| {
+                    format!("fetch block hash for checkpoint at block {target}")
+                })?;
+            self.repositories
+                .ledger()
+                .advance_checkpoint(source.id, target, &processed_block_hash, target)
+                .context("advance source checkpoint")?;
+            completed_range = None;
+        }
+
+        Ok(summary)
     }
 }
 
