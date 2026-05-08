@@ -83,8 +83,8 @@ This repository is intended to grow through small, reviewable checkpoints:
 3. Diesel schema and migrations
 4. Job leasing
 5. Live token event scanner
-6. Ingest worker
-7. Ledger queries and API
+6. Ledger query API
+7. Ingest worker
 8. Replay and backfill
 9. Observability and doctor CLI
 
@@ -92,7 +92,7 @@ Each checkpoint should keep the project buildable, include focused validation, a
 
 ## Current Status
 
-Checkpoint 5 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, and a live `scan-contract` CLI that fetches ERC-20, ERC-721, or ERC-1155 transfer logs from an EVM RPC endpoint and persists a ledger slice. API, worker execution, replay, and observability will be introduced in later checkpoints.
+Checkpoint 6 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI that fetches ERC-20, ERC-721, or ERC-1155 transfer logs from an EVM RPC endpoint, and a read API for querying indexed ledger slices. Worker execution, replay, and observability will be introduced in later checkpoints.
 
 ## Development
 
@@ -188,3 +188,54 @@ cargo run -- scan-contract \
 ```
 
 The default chunk size is 10 blocks so the command works with RPC providers that tightly limit `eth_getLogs` ranges. Increase `--chunk-size` when your provider plan allows wider log queries. The default `latest` end block resolves to `head - finality_confirmations`, and the command verifies that the contract has bytecode on the selected chain before printing decoded log counts, persisted ledger entries, minters, and current holders for the indexed block slice.
+
+## HTTP API
+
+Start the read API after running migrations and indexing at least one contract:
+
+```sh
+export DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs
+cargo run -- serve --bind 127.0.0.1:3000
+```
+
+Health check:
+
+```sh
+curl http://127.0.0.1:3000/health
+```
+
+Contract summary for an indexed Ethereum ERC-721 slice:
+
+```sh
+curl http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/summary
+```
+
+Current holders in the indexed slice:
+
+```sh
+curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/holders?limit=25"
+```
+
+Minters in the indexed slice:
+
+```sh
+curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/minters?limit=25"
+```
+
+Recent ledger transfers:
+
+```sh
+curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/transfers?limit=25"
+```
+
+Token provenance path:
+
+```sh
+curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/tokens/4785/path"
+```
+
+Polygon contracts use their own chain id:
+
+```sh
+curl http://127.0.0.1:3000/chains/137/contracts/0x2953399124f0cbb46d2cbacd8a89cf0599974963/summary
+```

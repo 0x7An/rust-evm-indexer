@@ -1,11 +1,16 @@
+use std::net::SocketAddr;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use indexer_rs::infra::{
-    evm::{
-        decoder::{TokenStandard, decode_log},
-        rpc::EvmRpcClient,
+use indexer_rs::{
+    api,
+    infra::{
+        evm::{
+            decoder::{TokenStandard, decode_log},
+            rpc::EvmRpcClient,
+        },
+        postgres::{connection::build_pool, repositories::PostgresRepositories},
     },
-    postgres::{connection::build_pool, repositories::PostgresRepositories},
 };
 
 #[derive(Debug, Parser)]
@@ -64,6 +69,17 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         chunk_size: u64,
     },
+
+    /// Run the HTTP read API for indexed ledger data.
+    Serve {
+        /// Postgres database URL. Prefer DATABASE_URL for local use.
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+
+        /// Socket address to bind.
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        bind: SocketAddr,
+    },
 }
 
 #[tokio::main]
@@ -103,7 +119,19 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Commands::Serve { database_url, bind } => serve_api(database_url, bind).await,
     }
+}
+
+async fn serve_api(database_url: String, bind: SocketAddr) -> Result<()> {
+    let pool = build_pool(&database_url).context("build postgres pool")?;
+    let app = api::router(pool);
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind API listener on {bind}"))?;
+
+    println!("API listening on http://{bind}");
+    axum::serve(listener, app).await.context("serve HTTP API")
 }
 
 async fn scan_contract(

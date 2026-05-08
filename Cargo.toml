@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 bigdecimal = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -30,3 +31,4 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 diesel_migrations = "2"
+tower = { version = "0.5", features = ["util"] }

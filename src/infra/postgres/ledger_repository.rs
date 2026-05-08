@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use bigdecimal::{BigDecimal, Zero};
 use diesel::{PgConnection, prelude::*, upsert::excluded};
+use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -26,6 +27,53 @@ pub struct ScanSummary {
     pub holder_count: i64,
     pub minter_count: i64,
     pub top_holders: Vec<TokenBalanceRow>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContractSummary {
+    pub source_id: Uuid,
+    pub chain_id: i64,
+    pub contract_address: String,
+    pub token_standard: String,
+    pub start_block: i64,
+    pub enabled: bool,
+    pub event_count: i64,
+    pub ledger_entry_count: i64,
+    pub holder_count: i64,
+    pub minter_count: i64,
+    pub first_indexed_block: Option<i64>,
+    pub last_indexed_block: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HolderBalance {
+    pub holder_address: String,
+    pub token_id: String,
+    pub balance: String,
+    pub first_received_block: Option<i64>,
+    pub last_moved_block: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MinterSummary {
+    pub minter_address: String,
+    pub mint_count: i64,
+    pub first_mint_block: i64,
+    pub last_mint_block: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LedgerTransfer {
+    pub movement_type: String,
+    pub operator_address: Option<String>,
+    pub from_address: Option<String>,
+    pub to_address: Option<String>,
+    pub token_id: String,
+    pub amount: String,
+    pub block_number: i64,
+    pub transaction_hash: String,
+    pub log_index: i32,
+    pub batch_index: i32,
 }
 
 #[derive(Clone)]
@@ -143,6 +191,191 @@ impl LedgerRepository {
             })
         })
         .context("persist decoded logs")
+    }
+
+    pub fn source_by_contract(
+        &self,
+        chain_id: i64,
+        contract_address: &str,
+    ) -> Result<Option<SourceRow>> {
+        let mut conn = self.connection()?;
+        self.source_by_contract_conn(&mut conn, chain_id, contract_address)
+    }
+
+    pub fn contract_summary(
+        &self,
+        chain_id: i64,
+        contract_address: &str,
+    ) -> Result<Option<ContractSummary>> {
+        let mut conn = self.connection()?;
+        let Some(source) = self.source_by_contract_conn(&mut conn, chain_id, contract_address)?
+        else {
+            return Ok(None);
+        };
+
+        let event_count = events::table
+            .filter(events::source_id.eq(source.id))
+            .filter(events::orphaned.eq(false))
+            .count()
+            .get_result(&mut conn)
+            .context("count source events")?;
+        let ledger_entry_count = ledger_entries::table
+            .filter(ledger_entries::source_id.eq(source.id))
+            .filter(ledger_entries::orphaned.eq(false))
+            .count()
+            .get_result(&mut conn)
+            .context("count ledger entries")?;
+        let holder_count = self.holder_count_conn(&mut conn, source.id)?;
+        let minter_count = self.minter_count_conn(&mut conn, source.id)?;
+        let first_indexed_block = self.first_block_conn(&mut conn, source.id)?;
+        let last_indexed_block = self.last_block_conn(&mut conn, source.id)?;
+
+        Ok(Some(ContractSummary {
+            source_id: source.id,
+            chain_id: source.chain_id,
+            contract_address: source.contract_address,
+            token_standard: source.token_standard,
+            start_block: source.start_block,
+            enabled: source.enabled,
+            event_count,
+            ledger_entry_count,
+            holder_count,
+            minter_count,
+            first_indexed_block,
+            last_indexed_block,
+        }))
+    }
+
+    pub fn holders(
+        &self,
+        chain_id: i64,
+        contract_address: &str,
+        limit: i64,
+    ) -> Result<Option<Vec<HolderBalance>>> {
+        let mut conn = self.connection()?;
+        let Some(source) = self.source_by_contract_conn(&mut conn, chain_id, contract_address)?
+        else {
+            return Ok(None);
+        };
+
+        let rows = self.top_holders_conn(&mut conn, source.id, clamp_limit(limit))?;
+        Ok(Some(rows.into_iter().map(HolderBalance::from).collect()))
+    }
+
+    pub fn minters(
+        &self,
+        chain_id: i64,
+        contract_address: &str,
+        limit: i64,
+    ) -> Result<Option<Vec<MinterSummary>>> {
+        let mut conn = self.connection()?;
+        let Some(source) = self.source_by_contract_conn(&mut conn, chain_id, contract_address)?
+        else {
+            return Ok(None);
+        };
+
+        let rows = ledger_entries::table
+            .filter(ledger_entries::source_id.eq(source.id))
+            .filter(ledger_entries::movement_type.eq("mint"))
+            .filter(ledger_entries::orphaned.eq(false))
+            .order((
+                ledger_entries::block_number.asc(),
+                ledger_entries::log_index.asc(),
+                ledger_entries::batch_index.asc(),
+            ))
+            .load::<LedgerEntryRow>(&mut conn)
+            .context("load minter ledger entries")?;
+
+        let mut minters: HashMap<String, MinterAccumulator> = HashMap::new();
+        for row in rows {
+            let Some(address) = row.to_address else {
+                continue;
+            };
+            let entry = minters.entry(address).or_insert_with(|| MinterAccumulator {
+                mint_count: 0,
+                first_mint_block: row.block_number,
+                last_mint_block: row.block_number,
+            });
+            entry.mint_count += 1;
+            entry.first_mint_block = entry.first_mint_block.min(row.block_number);
+            entry.last_mint_block = entry.last_mint_block.max(row.block_number);
+        }
+
+        let mut summaries = minters
+            .into_iter()
+            .map(|(minter_address, value)| MinterSummary {
+                minter_address,
+                mint_count: value.mint_count,
+                first_mint_block: value.first_mint_block,
+                last_mint_block: value.last_mint_block,
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| {
+            right
+                .mint_count
+                .cmp(&left.mint_count)
+                .then_with(|| left.first_mint_block.cmp(&right.first_mint_block))
+                .then_with(|| left.minter_address.cmp(&right.minter_address))
+        });
+        summaries.truncate(clamp_limit(limit) as usize);
+
+        Ok(Some(summaries))
+    }
+
+    pub fn transfers(
+        &self,
+        chain_id: i64,
+        contract_address: &str,
+        limit: i64,
+    ) -> Result<Option<Vec<LedgerTransfer>>> {
+        let mut conn = self.connection()?;
+        let Some(source) = self.source_by_contract_conn(&mut conn, chain_id, contract_address)?
+        else {
+            return Ok(None);
+        };
+
+        let rows = ledger_entries::table
+            .filter(ledger_entries::source_id.eq(source.id))
+            .filter(ledger_entries::orphaned.eq(false))
+            .order((
+                ledger_entries::block_number.desc(),
+                ledger_entries::log_index.desc(),
+                ledger_entries::batch_index.desc(),
+            ))
+            .limit(clamp_limit(limit))
+            .load::<LedgerEntryRow>(&mut conn)
+            .context("load ledger transfers")?;
+
+        Ok(Some(rows.into_iter().map(LedgerTransfer::from).collect()))
+    }
+
+    pub fn token_path(
+        &self,
+        chain_id: i64,
+        contract_address: &str,
+        token_id: &str,
+        limit: i64,
+    ) -> Result<Option<Vec<LedgerTransfer>>> {
+        let mut conn = self.connection()?;
+        let Some(source) = self.source_by_contract_conn(&mut conn, chain_id, contract_address)?
+        else {
+            return Ok(None);
+        };
+
+        let rows = ledger_entries::table
+            .filter(ledger_entries::source_id.eq(source.id))
+            .filter(ledger_entries::token_id.eq(token_id))
+            .filter(ledger_entries::orphaned.eq(false))
+            .order((
+                ledger_entries::block_number.asc(),
+                ledger_entries::log_index.asc(),
+                ledger_entries::batch_index.asc(),
+            ))
+            .limit(clamp_limit(limit))
+            .load::<LedgerEntryRow>(&mut conn)
+            .context("load token path")?;
+
+        Ok(Some(rows.into_iter().map(LedgerTransfer::from).collect()))
     }
 
     fn upsert_event(
@@ -351,6 +584,42 @@ impl LedgerRepository {
             .context("load top holders")
     }
 
+    fn source_by_contract_conn(
+        &self,
+        conn: &mut PgConnection,
+        chain_id: i64,
+        contract_address: &str,
+    ) -> Result<Option<SourceRow>> {
+        sources::table
+            .filter(sources::chain_id.eq(chain_id))
+            .filter(sources::contract_address.eq(contract_address.to_ascii_lowercase()))
+            .first(conn)
+            .optional()
+            .context("load source by contract")
+    }
+
+    fn first_block_conn(&self, conn: &mut PgConnection, source_id: Uuid) -> Result<Option<i64>> {
+        ledger_entries::table
+            .filter(ledger_entries::source_id.eq(source_id))
+            .filter(ledger_entries::orphaned.eq(false))
+            .select(ledger_entries::block_number)
+            .order(ledger_entries::block_number.asc())
+            .first(conn)
+            .optional()
+            .context("load first indexed block")
+    }
+
+    fn last_block_conn(&self, conn: &mut PgConnection, source_id: Uuid) -> Result<Option<i64>> {
+        ledger_entries::table
+            .filter(ledger_entries::source_id.eq(source_id))
+            .filter(ledger_entries::orphaned.eq(false))
+            .select(ledger_entries::block_number)
+            .order(ledger_entries::block_number.desc())
+            .first(conn)
+            .optional()
+            .context("load last indexed block")
+    }
+
     fn connection(
         &self,
     ) -> Result<diesel::r2d2::PooledConnection<diesel::r2d2::ConnectionManager<PgConnection>>> {
@@ -373,6 +642,46 @@ impl Default for BalanceAccumulator {
             last_moved_block: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct MinterAccumulator {
+    mint_count: i64,
+    first_mint_block: i64,
+    last_mint_block: i64,
+}
+
+impl From<TokenBalanceRow> for HolderBalance {
+    fn from(row: TokenBalanceRow) -> Self {
+        Self {
+            holder_address: row.holder_address,
+            token_id: row.token_id,
+            balance: row.balance.to_string(),
+            first_received_block: row.first_received_block,
+            last_moved_block: row.last_moved_block,
+        }
+    }
+}
+
+impl From<LedgerEntryRow> for LedgerTransfer {
+    fn from(row: LedgerEntryRow) -> Self {
+        Self {
+            movement_type: row.movement_type,
+            operator_address: row.operator_address,
+            from_address: row.from_address,
+            to_address: row.to_address,
+            token_id: row.token_id,
+            amount: row.amount.to_string(),
+            block_number: row.block_number,
+            transaction_hash: row.transaction_hash,
+            log_index: row.log_index,
+            batch_index: row.batch_index,
+        }
+    }
+}
+
+fn clamp_limit(limit: i64) -> i64 {
+    limit.clamp(1, 100)
 }
 
 fn non_zero_address(value: &str) -> Option<String> {
