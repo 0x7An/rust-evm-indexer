@@ -34,7 +34,7 @@ enum Commands {
     /// Fetch standard token logs for a contract and persist a ledger slice.
     ScanContract {
         /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
-        #[arg(long, env = "EVM_RPC_URL", hide_env_values = true)]
+        #[arg(long)]
         rpc_url: Option<String>,
 
         /// Postgres database URL. Prefer DATABASE_URL for local use.
@@ -81,7 +81,7 @@ enum Commands {
     /// Enqueue a durable ingestion job for a contract range.
     EnqueueContract {
         /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
-        #[arg(long, env = "EVM_RPC_URL", hide_env_values = true)]
+        #[arg(long)]
         rpc_url: Option<String>,
 
         /// Postgres database URL. Prefer DATABASE_URL for local use.
@@ -128,7 +128,7 @@ enum Commands {
     /// Plan a contract backfill as deterministic durable ingestion jobs.
     BackfillContract {
         /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
-        #[arg(long, env = "EVM_RPC_URL", hide_env_values = true)]
+        #[arg(long)]
         rpc_url: Option<String>,
 
         /// Postgres database URL. Prefer DATABASE_URL for local use.
@@ -205,7 +205,7 @@ enum WorkerCommands {
     /// Lease and execute at most one queued ingestion job.
     RunOnce {
         /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
-        #[arg(long, env = "EVM_RPC_URL", hide_env_values = true)]
+        #[arg(long)]
         rpc_url: Option<String>,
 
         /// Postgres database URL. Prefer DATABASE_URL for local use.
@@ -232,7 +232,7 @@ enum WorkerCommands {
     /// Continuously lease and execute queued ingestion jobs.
     Run {
         /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
-        #[arg(long, env = "EVM_RPC_URL", hide_env_values = true)]
+        #[arg(long)]
         rpc_url: Option<String>,
 
         /// Postgres database URL. Prefer DATABASE_URL for local use.
@@ -310,7 +310,7 @@ async fn main() -> Result<()> {
             lookback,
             chunk_size,
         } => {
-            let rpc_url = rpc_url_from_args(rpc_url)?;
+            let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
 
             scan_contract(
                 rpc_url,
@@ -340,7 +340,7 @@ async fn main() -> Result<()> {
             lookback,
             max_attempts,
         } => {
-            let rpc_url = rpc_url_from_args(rpc_url)?;
+            let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
 
             enqueue_contract(
                 rpc_url,
@@ -371,7 +371,7 @@ async fn main() -> Result<()> {
             range_size,
             max_attempts,
         } => {
-            let rpc_url = rpc_url_from_args(rpc_url)?;
+            let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
 
             backfill_contract(
                 rpc_url,
@@ -399,7 +399,7 @@ async fn main() -> Result<()> {
                 lease_seconds,
                 chunk_size,
             } => {
-                let rpc_url = rpc_url_from_args(rpc_url)?;
+                let rpc_url = rpc_url_from_args(rpc_url, chain_id)?;
                 worker_run_once(
                     rpc_url,
                     database_url,
@@ -421,7 +421,7 @@ async fn main() -> Result<()> {
                 stop_when_idle,
                 idle_sleep_ms,
             } => {
-                let rpc_url = rpc_url_from_args(rpc_url)?;
+                let rpc_url = rpc_url_from_args(rpc_url, chain_id)?;
                 worker_run(
                     rpc_url,
                     database_url,
@@ -960,8 +960,50 @@ fn print_scan_summary(summary: &indexer_rs::infra::postgres::ledger_repository::
     println!("Minters in indexed slice: {}", summary.minter_count);
 }
 
-fn rpc_url_from_args(value: Option<String>) -> Result<String> {
-    value
-        .or_else(|| std::env::var("ETH_RPC_URL").ok())
-        .context("missing RPC URL; set --rpc-url, EVM_RPC_URL, or ETH_RPC_URL")
+fn rpc_url_from_args(value: Option<String>, chain_id: Option<i64>) -> Result<String> {
+    let value = match value {
+        Some(value) => value,
+        None => rpc_url_from_env(chain_id)?,
+    };
+    validate_rpc_url_chain_hint(&value, chain_id)?;
+
+    Ok(value)
+}
+
+fn rpc_url_from_env(chain_id: Option<i64>) -> Result<String> {
+    if let Some(env_name) = chain_rpc_env_name(chain_id) {
+        if let Ok(value) = std::env::var(env_name) {
+            return Ok(value);
+        }
+    }
+
+    std::env::var("EVM_RPC_URL")
+        .or_else(|_| std::env::var("ETH_RPC_URL"))
+        .with_context(|| {
+            let chain_env = chain_rpc_env_name(chain_id)
+                .map(|name| format!("{name}, "))
+                .unwrap_or_default();
+            format!("missing RPC URL; set --rpc-url, {chain_env}EVM_RPC_URL, or ETH_RPC_URL")
+        })
+}
+
+fn chain_rpc_env_name(chain_id: Option<i64>) -> Option<&'static str> {
+    match chain_id {
+        Some(1) => Some("ETH_MAINNET_RPC_URL"),
+        Some(137) => Some("POLYGON_MAINNET_RPC_URL"),
+        _ => None,
+    }
+}
+
+fn validate_rpc_url_chain_hint(value: &str, chain_id: Option<i64>) -> Result<()> {
+    let lower = value.to_ascii_lowercase();
+    match chain_id {
+        Some(1) if lower.contains("polygon") => {
+            bail!("selected RPC URL looks like Polygon, but --chain-id is 1")
+        }
+        Some(137) if lower.contains("eth-mainnet") || lower.contains("ethereum") => {
+            bail!("selected RPC URL looks like Ethereum mainnet, but --chain-id is 137")
+        }
+        _ => Ok(()),
+    }
 }

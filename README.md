@@ -133,15 +133,18 @@ development.
 
 ## Live Contract Scan
 
-Set `EVM_RPC_URL` locally instead of committing provider credentials:
+Set RPC URLs locally instead of committing provider credentials:
 
 ```sh
 export DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs
-export EVM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/your-api-key
+export ETH_MAINNET_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/your-api-key
+export POLYGON_MAINNET_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/your-api-key
 ```
 
 The CLI also loads a local, unversioned `.env` file automatically before
-parsing arguments.
+parsing arguments. Commands with `--chain-id 1` prefer `ETH_MAINNET_RPC_URL`;
+commands with `--chain-id 137` prefer `POLYGON_MAINNET_RPC_URL`; `EVM_RPC_URL`
+is kept as a generic fallback.
 
 Scan an Ethereum ERC-721 contract:
 
@@ -156,8 +159,6 @@ cargo run -- scan-contract \
 Scan a Polygon ERC-1155 contract:
 
 ```sh
-export EVM_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/your-api-key
-
 cargo run -- scan-contract \
   --chain-name polygon-mainnet \
   --chain-id 137 \
