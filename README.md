@@ -92,13 +92,22 @@ Each checkpoint should keep the project buildable, include focused validation, a
 
 ## Current Status
 
-Checkpoint 3 is the active milestone. The project currently contains the public Rust skeleton, pure domain model, and initial Diesel/Postgres schema. Real RPC, API, worker execution, and runtime migration commands will be introduced in later checkpoints.
+Checkpoint 4 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, and durable job leasing repository tests. Real RPC, API, worker execution, and runtime migration commands will be introduced in later checkpoints.
 
 ## Development
 
 ```sh
 cargo fmt
 cargo check
+cargo test
+```
+
+`cargo test` includes Postgres-backed job repository integration tests. Start
+the local database and run migrations before the full test suite:
+
+```sh
+docker compose up -d postgres
+DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs diesel migration run
 cargo test
 ```
 
