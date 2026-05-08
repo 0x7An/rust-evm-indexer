@@ -1,0 +1,9 @@
+DROP TABLE reorg_events;
+DROP TABLE job_attempts;
+DROP TABLE jobs;
+DROP TABLE token_balances;
+DROP TABLE ledger_entries;
+DROP TABLE events;
+DROP TABLE checkpoints;
+DROP TABLE sources;
+DROP TABLE chains;
