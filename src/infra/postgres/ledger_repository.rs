@@ -82,6 +82,36 @@ pub struct LedgerTransfer {
     pub batch_index: i32,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LedgerCursor {
+    pub block_number: i64,
+    pub log_index: i32,
+    pub batch_index: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerQuery {
+    pub limit: i64,
+    pub cursor: Option<LedgerCursor>,
+    pub from_block: Option<i64>,
+    pub to_block: Option<i64>,
+    pub holder: Option<String>,
+    pub token_id: Option<String>,
+    pub movement_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LedgerPage<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<LedgerCursor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerSort {
+    Asc,
+    Desc,
+}
+
 #[derive(Clone)]
 pub struct LedgerRepository {
     pool: PgPool,
@@ -479,25 +509,40 @@ impl LedgerRepository {
         contract_address: &str,
         limit: i64,
     ) -> Result<Option<Vec<LedgerTransfer>>> {
+        let page = self.transfers_page(
+            chain_id,
+            contract_address,
+            LedgerQuery {
+                limit,
+                cursor: None,
+                from_block: None,
+                to_block: None,
+                holder: None,
+                token_id: None,
+                movement_type: None,
+            },
+        )?;
+
+        Ok(page.map(|page| page.items))
+    }
+
+    pub fn transfers_page(
+        &self,
+        chain_id: i64,
+        contract_address: &str,
+        query: LedgerQuery,
+    ) -> Result<Option<LedgerPage<LedgerTransfer>>> {
         let mut conn = self.connection()?;
         let Some(source) = self.source_by_contract_conn(&mut conn, chain_id, contract_address)?
         else {
             return Ok(None);
         };
 
-        let rows = ledger_entries::table
-            .filter(ledger_entries::source_id.eq(source.id))
-            .filter(ledger_entries::orphaned.eq(false))
-            .order((
-                ledger_entries::block_number.desc(),
-                ledger_entries::log_index.desc(),
-                ledger_entries::batch_index.desc(),
-            ))
-            .limit(clamp_limit(limit))
-            .load::<LedgerEntryRow>(&mut conn)
+        let page = self
+            .ledger_page_conn(&mut conn, source.id, query, LedgerSort::Desc)
             .context("load ledger transfers")?;
 
-        Ok(Some(rows.into_iter().map(LedgerTransfer::from).collect()))
+        Ok(Some(page))
     }
 
     pub fn token_path(
@@ -507,26 +552,43 @@ impl LedgerRepository {
         token_id: &str,
         limit: i64,
     ) -> Result<Option<Vec<LedgerTransfer>>> {
+        let page = self.token_path_page(
+            chain_id,
+            contract_address,
+            token_id,
+            LedgerQuery {
+                limit,
+                cursor: None,
+                from_block: None,
+                to_block: None,
+                holder: None,
+                token_id: None,
+                movement_type: None,
+            },
+        )?;
+
+        Ok(page.map(|page| page.items))
+    }
+
+    pub fn token_path_page(
+        &self,
+        chain_id: i64,
+        contract_address: &str,
+        token_id: &str,
+        mut query: LedgerQuery,
+    ) -> Result<Option<LedgerPage<LedgerTransfer>>> {
         let mut conn = self.connection()?;
         let Some(source) = self.source_by_contract_conn(&mut conn, chain_id, contract_address)?
         else {
             return Ok(None);
         };
 
-        let rows = ledger_entries::table
-            .filter(ledger_entries::source_id.eq(source.id))
-            .filter(ledger_entries::token_id.eq(token_id))
-            .filter(ledger_entries::orphaned.eq(false))
-            .order((
-                ledger_entries::block_number.asc(),
-                ledger_entries::log_index.asc(),
-                ledger_entries::batch_index.asc(),
-            ))
-            .limit(clamp_limit(limit))
-            .load::<LedgerEntryRow>(&mut conn)
+        query.token_id = Some(token_id.to_string());
+        let page = self
+            .ledger_page_conn(&mut conn, source.id, query, LedgerSort::Asc)
             .context("load token path")?;
 
-        Ok(Some(rows.into_iter().map(LedgerTransfer::from).collect()))
+        Ok(Some(page))
     }
 
     fn upsert_event(
@@ -771,6 +833,95 @@ impl LedgerRepository {
             .context("load last indexed block")
     }
 
+    fn ledger_page_conn(
+        &self,
+        conn: &mut PgConnection,
+        source_id: Uuid,
+        query: LedgerQuery,
+        sort: LedgerSort,
+    ) -> Result<LedgerPage<LedgerTransfer>> {
+        let mut db_query = ledger_entries::table
+            .filter(ledger_entries::source_id.eq(source_id))
+            .filter(ledger_entries::orphaned.eq(false))
+            .into_boxed();
+
+        if let Some(from_block) = query.from_block {
+            db_query = db_query.filter(ledger_entries::block_number.ge(from_block));
+        }
+        if let Some(to_block) = query.to_block {
+            db_query = db_query.filter(ledger_entries::block_number.le(to_block));
+        }
+        if let Some(holder) = query.holder {
+            let holder = holder.to_ascii_lowercase();
+            db_query = db_query.filter(
+                ledger_entries::from_address
+                    .eq(Some(holder.clone()))
+                    .or(ledger_entries::to_address.eq(Some(holder))),
+            );
+        }
+        if let Some(token_id) = query.token_id {
+            db_query = db_query.filter(ledger_entries::token_id.eq(token_id));
+        }
+        if let Some(movement_type) = query.movement_type {
+            db_query = db_query
+                .filter(ledger_entries::movement_type.eq(movement_type.to_ascii_lowercase()));
+        }
+        if let Some(cursor) = query.cursor {
+            db_query = match sort {
+                LedgerSort::Asc => db_query.filter(
+                    ledger_entries::block_number
+                        .gt(cursor.block_number)
+                        .or(ledger_entries::block_number
+                            .eq(cursor.block_number)
+                            .and(ledger_entries::log_index.gt(cursor.log_index)))
+                        .or(ledger_entries::block_number
+                            .eq(cursor.block_number)
+                            .and(ledger_entries::log_index.eq(cursor.log_index))
+                            .and(ledger_entries::batch_index.gt(cursor.batch_index))),
+                ),
+                LedgerSort::Desc => db_query.filter(
+                    ledger_entries::block_number
+                        .lt(cursor.block_number)
+                        .or(ledger_entries::block_number
+                            .eq(cursor.block_number)
+                            .and(ledger_entries::log_index.lt(cursor.log_index)))
+                        .or(ledger_entries::block_number
+                            .eq(cursor.block_number)
+                            .and(ledger_entries::log_index.eq(cursor.log_index))
+                            .and(ledger_entries::batch_index.lt(cursor.batch_index))),
+                ),
+            };
+        }
+
+        db_query = match sort {
+            LedgerSort::Asc => db_query.order((
+                ledger_entries::block_number.asc(),
+                ledger_entries::log_index.asc(),
+                ledger_entries::batch_index.asc(),
+            )),
+            LedgerSort::Desc => db_query.order((
+                ledger_entries::block_number.desc(),
+                ledger_entries::log_index.desc(),
+                ledger_entries::batch_index.desc(),
+            )),
+        };
+
+        let limit = clamp_limit(query.limit);
+        let mut rows = db_query
+            .limit(limit + 1)
+            .load::<LedgerEntryRow>(conn)
+            .context("load ledger page")?;
+        let next_cursor = if rows.len() > limit as usize {
+            rows.truncate(limit as usize);
+            rows.last().map(LedgerCursor::from)
+        } else {
+            None
+        };
+        let items = rows.into_iter().map(LedgerTransfer::from).collect();
+
+        Ok(LedgerPage { items, next_cursor })
+    }
+
     fn connection(
         &self,
     ) -> Result<diesel::r2d2::PooledConnection<diesel::r2d2::ConnectionManager<PgConnection>>> {
@@ -825,6 +976,16 @@ impl From<LedgerEntryRow> for LedgerTransfer {
             amount: row.amount.to_string(),
             block_number: row.block_number,
             transaction_hash: row.transaction_hash,
+            log_index: row.log_index,
+            batch_index: row.batch_index,
+        }
+    }
+}
+
+impl From<&LedgerEntryRow> for LedgerCursor {
+    fn from(row: &LedgerEntryRow) -> Self {
+        Self {
+            block_number: row.block_number,
             log_index: row.log_index,
             batch_index: row.batch_index,
         }

@@ -12,7 +12,9 @@ use serde_json::json;
 
 use crate::infra::postgres::{
     connection::PgPool,
-    ledger_repository::{ContractSummary, HolderBalance, LedgerTransfer, MinterSummary},
+    ledger_repository::{
+        ContractSummary, HolderBalance, LedgerCursor, LedgerQuery, LedgerTransfer, MinterSummary,
+    },
     repositories::PostgresRepositories,
 };
 
@@ -96,30 +98,31 @@ async fn contract_minters(
 async fn contract_transfers(
     State(state): State<ApiState>,
     Path((chain_id, contract_address)): Path<(i64, String)>,
-    Query(query): Query<LimitQuery>,
-) -> ApiResult<Json<ItemsResponse<LedgerTransfer>>> {
+    Query(query): Query<LedgerPageQuery>,
+) -> ApiResult<Json<PageResponse<LedgerTransfer>>> {
     let contract_address = normalize_contract_address(&contract_address)?;
-    let limit = query.limit_or_default(50)?;
+    let query = query.to_ledger_query(50)?;
     let repo = state.repositories.ledger().clone();
-    let transfers = blocking(move || repo.transfers(chain_id, &contract_address, limit)).await?;
-    let transfers = transfers.ok_or_else(|| ApiError::not_found("contract source not found"))?;
+    let page = blocking(move || repo.transfers_page(chain_id, &contract_address, query)).await?;
+    let page = page.ok_or_else(|| ApiError::not_found("contract source not found"))?;
 
-    Ok(Json(ItemsResponse { items: transfers }))
+    Ok(Json(PageResponse::from(page)))
 }
 
 async fn token_path(
     State(state): State<ApiState>,
     Path((chain_id, contract_address, token_id)): Path<(i64, String, String)>,
-    Query(query): Query<LimitQuery>,
-) -> ApiResult<Json<ItemsResponse<LedgerTransfer>>> {
+    Query(query): Query<LedgerPageQuery>,
+) -> ApiResult<Json<PageResponse<LedgerTransfer>>> {
     let contract_address = normalize_contract_address(&contract_address)?;
-    let limit = query.limit_or_default(100)?;
+    let query = query.to_ledger_query(100)?;
     let repo = state.repositories.ledger().clone();
-    let path =
-        blocking(move || repo.token_path(chain_id, &contract_address, &token_id, limit)).await?;
-    let path = path.ok_or_else(|| ApiError::not_found("contract source not found"))?;
+    let page =
+        blocking(move || repo.token_path_page(chain_id, &contract_address, &token_id, query))
+            .await?;
+    let page = page.ok_or_else(|| ApiError::not_found("contract source not found"))?;
 
-    Ok(Json(ItemsResponse { items: path }))
+    Ok(Json(PageResponse::from(page)))
 }
 
 async fn blocking<T>(operation: impl FnOnce() -> anyhow::Result<T> + Send + 'static) -> ApiResult<T>
@@ -133,12 +136,22 @@ where
 }
 
 fn normalize_contract_address(value: &str) -> ApiResult<String> {
+    normalize_evm_address(value, "contract")
+}
+
+fn normalize_holder_address(value: &str) -> ApiResult<String> {
+    normalize_evm_address(value, "holder")
+}
+
+fn normalize_evm_address(value: &str, field: &str) -> ApiResult<String> {
     let normalized = value.to_ascii_lowercase();
     if normalized.len() != 42
         || !normalized.starts_with("0x")
         || !normalized[2..].chars().all(|ch| ch.is_ascii_hexdigit())
     {
-        return Err(ApiError::bad_request("invalid EVM contract address"));
+        return Err(ApiError::bad_request(format!(
+            "invalid EVM {field} address"
+        )));
     }
 
     Ok(normalized)
@@ -160,6 +173,103 @@ impl LimitQuery {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct LedgerPageQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+    from_block: Option<i64>,
+    to_block: Option<i64>,
+    holder: Option<String>,
+    token_id: Option<String>,
+    movement_type: Option<String>,
+}
+
+impl LedgerPageQuery {
+    fn to_ledger_query(&self, default_limit: i64) -> ApiResult<LedgerQuery> {
+        let limit = LimitQuery { limit: self.limit }.limit_or_default(default_limit)?;
+        if let Some(from_block) = self.from_block {
+            if from_block < 0 {
+                return Err(ApiError::bad_request("from_block cannot be negative"));
+            }
+        }
+        if let Some(to_block) = self.to_block {
+            if to_block < 0 {
+                return Err(ApiError::bad_request("to_block cannot be negative"));
+            }
+        }
+        if let (Some(from_block), Some(to_block)) = (self.from_block, self.to_block) {
+            if from_block > to_block {
+                return Err(ApiError::bad_request(
+                    "from_block cannot be greater than to_block",
+                ));
+            }
+        }
+
+        Ok(LedgerQuery {
+            limit,
+            cursor: self.cursor.as_deref().map(parse_cursor).transpose()?,
+            from_block: self.from_block,
+            to_block: self.to_block,
+            holder: self
+                .holder
+                .as_deref()
+                .map(normalize_holder_address)
+                .transpose()?,
+            token_id: self.token_id.clone(),
+            movement_type: self
+                .movement_type
+                .as_deref()
+                .map(normalize_movement_type)
+                .transpose()?,
+        })
+    }
+}
+
+fn parse_cursor(value: &str) -> ApiResult<LedgerCursor> {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(ApiError::bad_request("invalid cursor"));
+    }
+
+    let block_number = parts[0]
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request("invalid cursor"))?;
+    let log_index = parts[1]
+        .parse::<i32>()
+        .map_err(|_| ApiError::bad_request("invalid cursor"))?;
+    let batch_index = parts[2]
+        .parse::<i32>()
+        .map_err(|_| ApiError::bad_request("invalid cursor"))?;
+
+    if block_number < 0 || log_index < 0 || batch_index < 0 {
+        return Err(ApiError::bad_request("invalid cursor"));
+    }
+
+    Ok(LedgerCursor {
+        block_number,
+        log_index,
+        batch_index,
+    })
+}
+
+fn encode_cursor(cursor: &LedgerCursor) -> String {
+    format!(
+        "{}:{}:{}",
+        cursor.block_number, cursor.log_index, cursor.batch_index
+    )
+}
+
+fn normalize_movement_type(value: &str) -> ApiResult<String> {
+    let value = value.to_ascii_lowercase();
+    if !matches!(value.as_str(), "mint" | "transfer" | "burn") {
+        return Err(ApiError::bad_request(
+            "movement_type must be mint, transfer, or burn",
+        ));
+    }
+
+    Ok(value)
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -168,6 +278,21 @@ struct HealthResponse {
 #[derive(Debug, Serialize)]
 struct ItemsResponse<T> {
     items: Vec<T>,
+}
+
+#[derive(Debug, Serialize)]
+struct PageResponse<T> {
+    items: Vec<T>,
+    next_cursor: Option<String>,
+}
+
+impl<T> From<crate::infra::postgres::ledger_repository::LedgerPage<T>> for PageResponse<T> {
+    fn from(page: crate::infra::postgres::ledger_repository::LedgerPage<T>) -> Self {
+        Self {
+            items: page.items,
+            next_cursor: page.next_cursor.as_ref().map(encode_cursor),
+        }
+    }
 }
 
 type ApiResult<T> = Result<T, ApiError>;

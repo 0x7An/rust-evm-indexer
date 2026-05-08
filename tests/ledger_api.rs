@@ -158,6 +158,109 @@ async fn exposes_summary_holders_minters_transfers_and_token_path() {
 }
 
 #[tokio::test]
+async fn paginates_transfers_without_duplicates() {
+    let ctx = setup();
+
+    let first_page_uri = format!(
+        "/chains/{}/contracts/{}/transfers?limit=2",
+        ctx.chain_id, ctx.contract
+    );
+    let (status, first_page) = get_json(&ctx.app, &first_page_uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let first_items = first_page["items"].as_array().expect("first page items");
+    assert_eq!(
+        first_items
+            .iter()
+            .map(|item| item["block_number"].as_i64().expect("block number"))
+            .collect::<Vec<_>>(),
+        vec![102, 101]
+    );
+    let cursor = first_page["next_cursor"]
+        .as_str()
+        .expect("first page next cursor");
+    assert_eq!(cursor, "101:0:0");
+
+    let second_page_uri = format!(
+        "/chains/{}/contracts/{}/transfers?limit=2&cursor={cursor}",
+        ctx.chain_id, ctx.contract
+    );
+    let (status, second_page) = get_json(&ctx.app, &second_page_uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let second_items = second_page["items"].as_array().expect("second page items");
+    assert_eq!(second_items.len(), 1);
+    assert_eq!(second_items[0]["block_number"], 100);
+    assert!(second_page["next_cursor"].is_null());
+
+    let first_hashes = first_items
+        .iter()
+        .map(|item| item["transaction_hash"].as_str().expect("tx hash"))
+        .collect::<Vec<_>>();
+    let second_hashes = second_items
+        .iter()
+        .map(|item| item["transaction_hash"].as_str().expect("tx hash"))
+        .collect::<Vec<_>>();
+    assert!(
+        first_hashes
+            .iter()
+            .all(|hash| !second_hashes.contains(hash))
+    );
+}
+
+#[tokio::test]
+async fn filters_transfers_by_range_holder_token_and_movement() {
+    let ctx = setup();
+
+    let uri = format!(
+        "/chains/{}/contracts/{}/transfers?from_block=100&to_block=101&holder={}&token_id=42&movement_type=transfer",
+        ctx.chain_id,
+        ctx.contract,
+        address("11")
+    );
+    let (status, page) = get_json(&ctx.app, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = page["items"].as_array().expect("filtered transfer items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["block_number"], 101);
+    assert_eq!(items[0]["movement_type"], "transfer");
+    assert_eq!(items[0]["from_address"], address("11"));
+    assert_eq!(items[0]["to_address"], address("22"));
+    assert_eq!(items[0]["token_id"], "42");
+    assert!(page["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn paginates_token_path_in_chronological_order() {
+    let ctx = setup();
+
+    let first_page_uri = format!(
+        "/chains/{}/contracts/{}/tokens/42/path?limit=1",
+        ctx.chain_id, ctx.contract
+    );
+    let (status, first_page) = get_json(&ctx.app, &first_page_uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let first_items = first_page["items"].as_array().expect("first path items");
+    assert_eq!(first_items.len(), 1);
+    assert_eq!(first_items[0]["block_number"], 100);
+    assert_eq!(first_items[0]["movement_type"], "mint");
+    let cursor = first_page["next_cursor"]
+        .as_str()
+        .expect("path next cursor");
+    assert_eq!(cursor, "100:0:0");
+
+    let second_page_uri = format!(
+        "/chains/{}/contracts/{}/tokens/42/path?limit=1&cursor={cursor}",
+        ctx.chain_id, ctx.contract
+    );
+    let (status, second_page) = get_json(&ctx.app, &second_page_uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let second_items = second_page["items"].as_array().expect("second path items");
+    assert_eq!(second_items.len(), 1);
+    assert_eq!(second_items[0]["block_number"], 101);
+    assert_eq!(second_items[0]["movement_type"], "transfer");
+    assert!(second_page["next_cursor"].is_null());
+}
+
+#[tokio::test]
 async fn returns_clear_client_errors() {
     let ctx = setup();
 
@@ -182,6 +285,14 @@ async fn returns_clear_client_errors() {
     let (status, body) = get_json(&ctx.app, &invalid_limit_uri).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "limit must be between 1 and 100");
+
+    let invalid_cursor_uri = format!(
+        "/chains/{}/contracts/{}/transfers?cursor=not-a-cursor",
+        ctx.chain_id, ctx.contract
+    );
+    let (status, body) = get_json(&ctx.app, &invalid_cursor_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid cursor");
 }
 
 async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {

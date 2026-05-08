@@ -87,14 +87,15 @@ This repository is intended to grow through small, reviewable checkpoints:
 7. Ingest worker
 8. Contract backfill planning and checkpoints
 9. Continuous worker loop and job status CLI
-10. Repair/replay support
-11. Observability and doctor CLI
+10. Paginated ledger queries
+11. Repair/replay support
+12. Observability and doctor CLI
 
 Each checkpoint should keep the project buildable, include focused validation, and produce a clear commit/PR boundary.
 
 ## Current Status
 
-Checkpoint 9 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, and a read API for querying indexed ledger slices. Repair/replay support and observability will be introduced in later checkpoints.
+Checkpoint 10 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, and a cursor-paginated read API for querying indexed ledger slices. Repair/replay support and observability will be introduced in later checkpoints.
 
 ## Development
 
@@ -318,10 +319,28 @@ Recent ledger transfers:
 curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/transfers?limit=25"
 ```
 
+Transfers can be filtered and paged with a stable cursor:
+
+```sh
+curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/transfers?limit=100&from_block=12287507&to_block=12300000&token_id=4785&movement_type=transfer"
+```
+
+The response includes `items` and `next_cursor`. Pass `next_cursor` back as `cursor` to request the next page:
+
+```sh
+curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/transfers?limit=100&cursor=12300000:42:0"
+```
+
 Token provenance path:
 
 ```sh
 curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/tokens/4785/path"
+```
+
+Token paths are chronological and support the same cursor, block range, holder, and movement type filters:
+
+```sh
+curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/tokens/4785/path?limit=100"
 ```
 
 Polygon contracts use their own chain id:
