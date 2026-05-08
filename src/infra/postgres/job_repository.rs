@@ -107,7 +107,7 @@ impl JobRepository {
     }
 
     pub fn lease_next(&self, worker_id: &str, lease_for: Duration) -> QueryResult<Option<JobRow>> {
-        self.lease_next_candidate(worker_id, lease_for, None)
+        self.lease_next_candidate(worker_id, lease_for, None, None)
     }
 
     pub fn lease_next_for_type(
@@ -116,7 +116,17 @@ impl JobRepository {
         lease_for: Duration,
         job_type: JobType,
     ) -> QueryResult<Option<JobRow>> {
-        self.lease_next_candidate(worker_id, lease_for, Some(job_type))
+        self.lease_next_candidate(worker_id, lease_for, Some(job_type), None)
+    }
+
+    pub fn lease_next_for_type_and_chain(
+        &self,
+        worker_id: &str,
+        lease_for: Duration,
+        job_type: JobType,
+        chain_id: i64,
+    ) -> QueryResult<Option<JobRow>> {
+        self.lease_next_candidate(worker_id, lease_for, Some(job_type), Some(chain_id))
     }
 
     fn lease_next_candidate(
@@ -124,10 +134,11 @@ impl JobRepository {
         worker_id: &str,
         lease_for: Duration,
         job_type: Option<JobType>,
+        chain_id: Option<i64>,
     ) -> QueryResult<Option<JobRow>> {
         let mut conn = self.connection()?;
         conn.transaction(|conn| {
-            let candidate = self.lock_next_candidate(conn, job_type)?;
+            let candidate = self.lock_next_candidate(conn, job_type, chain_id)?;
 
             let Some(candidate) = candidate else {
                 return Ok(None);
@@ -283,11 +294,30 @@ impl JobRepository {
         &self,
         conn: &mut PgConnection,
         job_type: Option<JobType>,
+        chain_id: Option<i64>,
     ) -> QueryResult<Option<JobRow>> {
         let now = Utc::now();
 
-        if let Some(job_type) = job_type {
-            return jobs::table
+        match (job_type, chain_id) {
+            (Some(job_type), Some(chain_id)) => jobs::table
+                .filter(jobs::job_type.eq(job_type.to_string()))
+                .filter(jobs::chain_id.eq(chain_id))
+                .filter(
+                    jobs::status
+                        .eq(JobStatus::Queued.to_string())
+                        .or(jobs::status
+                            .eq_any([
+                                JobStatus::Leased.to_string(),
+                                JobStatus::Running.to_string(),
+                            ])
+                            .and(jobs::lease_expires_at.lt(now))),
+                )
+                .order(jobs::created_at.asc())
+                .for_update()
+                .skip_locked()
+                .first::<JobRow>(conn)
+                .optional(),
+            (Some(job_type), None) => jobs::table
                 .filter(jobs::job_type.eq(job_type.to_string()))
                 .filter(
                     jobs::status
@@ -303,25 +333,41 @@ impl JobRepository {
                 .for_update()
                 .skip_locked()
                 .first::<JobRow>(conn)
-                .optional();
+                .optional(),
+            (None, Some(chain_id)) => jobs::table
+                .filter(jobs::chain_id.eq(chain_id))
+                .filter(
+                    jobs::status
+                        .eq(JobStatus::Queued.to_string())
+                        .or(jobs::status
+                            .eq_any([
+                                JobStatus::Leased.to_string(),
+                                JobStatus::Running.to_string(),
+                            ])
+                            .and(jobs::lease_expires_at.lt(now))),
+                )
+                .order(jobs::created_at.asc())
+                .for_update()
+                .skip_locked()
+                .first::<JobRow>(conn)
+                .optional(),
+            (None, None) => jobs::table
+                .filter(
+                    jobs::status
+                        .eq(JobStatus::Queued.to_string())
+                        .or(jobs::status
+                            .eq_any([
+                                JobStatus::Leased.to_string(),
+                                JobStatus::Running.to_string(),
+                            ])
+                            .and(jobs::lease_expires_at.lt(now))),
+                )
+                .order(jobs::created_at.asc())
+                .for_update()
+                .skip_locked()
+                .first::<JobRow>(conn)
+                .optional(),
         }
-
-        jobs::table
-            .filter(
-                jobs::status
-                    .eq(JobStatus::Queued.to_string())
-                    .or(jobs::status
-                        .eq_any([
-                            JobStatus::Leased.to_string(),
-                            JobStatus::Running.to_string(),
-                        ])
-                        .and(jobs::lease_expires_at.lt(now))),
-            )
-            .order(jobs::created_at.asc())
-            .for_update()
-            .skip_locked()
-            .first::<JobRow>(conn)
-            .optional()
     }
 
     fn update_attempt_status(

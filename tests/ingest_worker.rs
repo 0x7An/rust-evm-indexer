@@ -124,7 +124,8 @@ async fn worker_processes_queued_ingest_job() {
         "worker-it",
         Duration::seconds(60),
         10,
-    );
+    )
+    .with_chain_id(ctx.chain_id);
     let outcome = worker.run_once().await.expect("run worker once");
 
     let WorkerOutcome::Processed {
@@ -174,7 +175,8 @@ async fn worker_returns_no_job_when_queue_is_empty() {
         "worker-it",
         Duration::seconds(60),
         10,
-    );
+    )
+    .with_chain_id(ctx.chain_id);
 
     let outcome = worker.run_once().await.expect("run worker once");
     assert!(matches!(outcome, WorkerOutcome::NoJob));

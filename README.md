@@ -137,6 +137,9 @@ export DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs
 export EVM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/your-api-key
 ```
 
+The CLI also loads a local, unversioned `.env` file automatically before
+parsing arguments.
+
 Scan an Ethereum ERC-721 contract:
 
 ```sh
@@ -212,11 +215,12 @@ Then run one worker lease/execution cycle:
 ```sh
 cargo run -- worker run-once \
   --worker-id local-worker \
+  --chain-id 137 \
   --lease-seconds 300 \
   --chunk-size 10
 ```
 
-`enqueue-contract` resolves the finalized range, verifies contract bytecode, creates or updates the source, and inserts an idempotent `INGEST_RANGE` job. `worker run-once` leases the next available job, marks it running, executes the same decoder/persistence path as `scan-contract`, and marks the job succeeded or failed.
+`enqueue-contract` resolves the finalized range, verifies contract bytecode, creates or updates the source, and inserts an idempotent `INGEST_RANGE` job. `worker run-once` leases the next available ingest job, optionally restricted by `--chain-id`, marks it running, executes the same decoder/persistence path as `scan-contract`, and marks the job succeeded or failed.
 
 ## HTTP API
 

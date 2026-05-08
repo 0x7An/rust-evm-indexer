@@ -22,6 +22,7 @@ pub struct IngestWorker {
     worker_id: String,
     lease_for: Duration,
     chunk_size: u64,
+    chain_id: Option<i64>,
 }
 
 impl IngestWorker {
@@ -38,7 +39,13 @@ impl IngestWorker {
             worker_id: worker_id.into(),
             lease_for,
             chunk_size,
+            chain_id: None,
         }
+    }
+
+    pub fn with_chain_id(mut self, chain_id: i64) -> Self {
+        self.chain_id = Some(chain_id);
+        self
     }
 
     pub async fn run_once(&self) -> Result<WorkerOutcome> {
@@ -46,12 +53,22 @@ impl IngestWorker {
             bail!("chunk-size must be greater than zero");
         }
 
-        let Some(leased) = self
-            .repositories
-            .jobs()
-            .lease_next_for_type(&self.worker_id, self.lease_for, JobType::IngestRange)
-            .context("lease next job")?
-        else {
+        let leased = match self.chain_id {
+            Some(chain_id) => self.repositories.jobs().lease_next_for_type_and_chain(
+                &self.worker_id,
+                self.lease_for,
+                JobType::IngestRange,
+                chain_id,
+            ),
+            None => self.repositories.jobs().lease_next_for_type(
+                &self.worker_id,
+                self.lease_for,
+                JobType::IngestRange,
+            ),
+        }
+        .context("lease next job")?;
+
+        let Some(leased) = leased else {
             return Ok(WorkerOutcome::NoJob);
         };
 

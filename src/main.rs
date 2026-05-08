@@ -158,6 +158,10 @@ enum WorkerCommands {
         #[arg(long, default_value = "local-worker")]
         worker_id: String,
 
+        /// Optional chain id to restrict leased jobs.
+        #[arg(long)]
+        chain_id: Option<i64>,
+
         /// Lease duration for the job.
         #[arg(long, default_value_t = 300)]
         lease_seconds: i64,
@@ -170,6 +174,7 @@ enum WorkerCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     let cli = Cli::parse();
 
     match cli.command {
@@ -239,11 +244,20 @@ async fn main() -> Result<()> {
                 rpc_url,
                 database_url,
                 worker_id,
+                chain_id,
                 lease_seconds,
                 chunk_size,
             } => {
                 let rpc_url = rpc_url_from_args(rpc_url)?;
-                worker_run_once(rpc_url, database_url, worker_id, lease_seconds, chunk_size).await
+                worker_run_once(
+                    rpc_url,
+                    database_url,
+                    worker_id,
+                    chain_id,
+                    lease_seconds,
+                    chunk_size,
+                )
+                .await
             }
         },
     }
@@ -446,6 +460,7 @@ async fn worker_run_once(
     rpc_url: String,
     database_url: String,
     worker_id: String,
+    chain_id: Option<i64>,
     lease_seconds: i64,
     chunk_size: u64,
 ) -> Result<()> {
@@ -455,13 +470,19 @@ async fn worker_run_once(
 
     let pool = build_pool(&database_url).context("build postgres pool")?;
     let repositories = PostgresRepositories::new(pool);
-    let worker = IngestWorker::new(
+    let mut worker = IngestWorker::new(
         repositories,
         EvmRpcClient::new(rpc_url),
         worker_id,
         Duration::seconds(lease_seconds),
         chunk_size,
     );
+    if let Some(chain_id) = chain_id {
+        if chain_id <= 0 {
+            bail!("chain-id must be greater than zero");
+        }
+        worker = worker.with_chain_id(chain_id);
+    }
 
     match worker.run_once().await? {
         WorkerOutcome::NoJob => println!("No queued jobs available."),
