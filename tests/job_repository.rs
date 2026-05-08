@@ -18,6 +18,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 struct TestContext {
     _guard: MutexGuard<'static, ()>,
     repo: JobRepository,
+    chain_id: i64,
 }
 
 fn setup() -> TestContext {
@@ -38,6 +39,7 @@ fn setup() -> TestContext {
     TestContext {
         _guard: guard,
         repo: JobRepository::new(pool),
+        chain_id: random_chain_id(),
     }
 }
 
@@ -60,6 +62,10 @@ fn key(name: &str) -> String {
     format!("it:{name}:{}", Uuid::new_v4())
 }
 
+fn random_chain_id() -> i64 {
+    8_000_000 + (Uuid::new_v4().as_u128() % 1_000_000) as i64
+}
+
 fn count_for(counts: &[JobStatusCount], status: JobStatus) -> i64 {
     counts
         .iter()
@@ -75,11 +81,11 @@ fn enqueue_is_idempotent_by_key() {
 
     let first = ctx
         .repo
-        .enqueue(NewJob::new(JobType::IngestRange, 84532, &key).with_range(10, 20))
+        .enqueue(NewJob::new(JobType::IngestRange, ctx.chain_id, &key).with_range(10, 20))
         .expect("insert job");
     let second = ctx
         .repo
-        .enqueue(NewJob::new(JobType::IngestRange, 84532, &key).with_range(10, 20))
+        .enqueue(NewJob::new(JobType::IngestRange, ctx.chain_id, &key).with_range(10, 20))
         .expect("find existing job");
 
     let EnqueueResult::Inserted(first) = first else {
@@ -98,12 +104,17 @@ fn lease_next_assigns_one_worker_and_records_attempt() {
     let ctx = setup();
     let key = key("lease");
     ctx.repo
-        .enqueue(NewJob::new(JobType::IngestRange, 84532, &key).with_range(1, 5))
+        .enqueue(NewJob::new(JobType::IngestRange, ctx.chain_id, &key).with_range(1, 5))
         .expect("insert job");
 
     let leased = ctx
         .repo
-        .lease_next("worker-a", Duration::seconds(60))
+        .lease_next_for_type_and_chain(
+            "worker-a",
+            Duration::seconds(60),
+            JobType::IngestRange,
+            ctx.chain_id,
+        )
         .expect("lease query")
         .expect("leased job");
 
@@ -123,17 +134,29 @@ fn lease_next_assigns_one_worker_and_records_attempt() {
 fn non_expired_lease_is_not_claimed_twice() {
     let ctx = setup();
     ctx.repo
-        .enqueue(NewJob::new(JobType::IngestRange, 84532, key("single-owner")).with_range(1, 5))
+        .enqueue(
+            NewJob::new(JobType::IngestRange, ctx.chain_id, key("single-owner")).with_range(1, 5),
+        )
         .expect("insert job");
 
     let first = ctx
         .repo
-        .lease_next("worker-a", Duration::seconds(60))
+        .lease_next_for_type_and_chain(
+            "worker-a",
+            Duration::seconds(60),
+            JobType::IngestRange,
+            ctx.chain_id,
+        )
         .expect("lease query")
         .expect("first worker leases job");
     let second = ctx
         .repo
-        .lease_next("worker-b", Duration::seconds(60))
+        .lease_next_for_type_and_chain(
+            "worker-b",
+            Duration::seconds(60),
+            JobType::IngestRange,
+            ctx.chain_id,
+        )
         .expect("lease query");
 
     assert_eq!(first.leased_by.as_deref(), Some("worker-a"));
@@ -144,11 +167,13 @@ fn non_expired_lease_is_not_claimed_twice() {
 fn lease_next_for_type_skips_other_job_types() {
     let ctx = setup();
     ctx.repo
-        .enqueue(NewJob::new(JobType::BackfillRange, 84532, key("backfill")).with_range(1, 5))
+        .enqueue(
+            NewJob::new(JobType::BackfillRange, ctx.chain_id, key("backfill")).with_range(1, 5),
+        )
         .expect("insert backfill job");
     let expected = ctx
         .repo
-        .enqueue(NewJob::new(JobType::IngestRange, 84532, key("ingest")).with_range(10, 20))
+        .enqueue(NewJob::new(JobType::IngestRange, ctx.chain_id, key("ingest")).with_range(10, 20))
         .expect("insert ingest job");
     let expected_id = match expected {
         EnqueueResult::Inserted(job) | EnqueueResult::Existing(job) => job.id,
@@ -156,7 +181,12 @@ fn lease_next_for_type_skips_other_job_types() {
 
     let leased = ctx
         .repo
-        .lease_next_for_type("worker-a", Duration::seconds(60), JobType::IngestRange)
+        .lease_next_for_type_and_chain(
+            "worker-a",
+            Duration::seconds(60),
+            JobType::IngestRange,
+            ctx.chain_id,
+        )
         .expect("lease query")
         .expect("leased ingest job");
 
@@ -167,8 +197,8 @@ fn lease_next_for_type_skips_other_job_types() {
 #[test]
 fn status_counts_group_and_filter_jobs() {
     let ctx = setup();
-    let chain_id = 84532;
-    let other_chain_id = 84533;
+    let chain_id = ctx.chain_id;
+    let other_chain_id = ctx.chain_id + 1;
 
     ctx.repo
         .enqueue(NewJob::new(JobType::IngestRange, chain_id, key("status-a")).with_range(1, 5))
@@ -229,17 +259,27 @@ fn status_counts_group_and_filter_jobs() {
 fn expired_lease_can_be_reclaimed() {
     let ctx = setup();
     ctx.repo
-        .enqueue(NewJob::new(JobType::IngestRange, 84532, key("expired")).with_range(1, 5))
+        .enqueue(NewJob::new(JobType::IngestRange, ctx.chain_id, key("expired")).with_range(1, 5))
         .expect("insert job");
 
     let first = ctx
         .repo
-        .lease_next("worker-a", Duration::seconds(-1))
+        .lease_next_for_type_and_chain(
+            "worker-a",
+            Duration::seconds(-1),
+            JobType::IngestRange,
+            ctx.chain_id,
+        )
         .expect("lease query")
         .expect("first worker leases job");
     let second = ctx
         .repo
-        .lease_next("worker-b", Duration::seconds(60))
+        .lease_next_for_type_and_chain(
+            "worker-b",
+            Duration::seconds(60),
+            JobType::IngestRange,
+            ctx.chain_id,
+        )
         .expect("lease query")
         .expect("second worker reclaims expired job");
 
@@ -253,7 +293,7 @@ fn failed_job_retries_until_dead_lettered() {
     let ctx = setup();
     ctx.repo
         .enqueue(
-            NewJob::new(JobType::IngestRange, 84532, key("retry"))
+            NewJob::new(JobType::IngestRange, ctx.chain_id, key("retry"))
                 .with_range(1, 5)
                 .with_max_attempts(2),
         )
@@ -261,7 +301,12 @@ fn failed_job_retries_until_dead_lettered() {
 
     let first = ctx
         .repo
-        .lease_next("worker-a", Duration::seconds(60))
+        .lease_next_for_type_and_chain(
+            "worker-a",
+            Duration::seconds(60),
+            JobType::IngestRange,
+            ctx.chain_id,
+        )
         .expect("lease query")
         .expect("first lease");
     let queued = ctx
@@ -274,7 +319,12 @@ fn failed_job_retries_until_dead_lettered() {
 
     let second = ctx
         .repo
-        .lease_next("worker-a", Duration::seconds(60))
+        .lease_next_for_type_and_chain(
+            "worker-a",
+            Duration::seconds(60),
+            JobType::IngestRange,
+            ctx.chain_id,
+        )
         .expect("lease query")
         .expect("second lease");
     let dead = ctx
@@ -295,12 +345,17 @@ fn failed_job_retries_until_dead_lettered() {
 fn running_and_succeeded_transitions_update_job_and_attempt() {
     let ctx = setup();
     ctx.repo
-        .enqueue(NewJob::new(JobType::IngestRange, 84532, key("success")).with_range(1, 5))
+        .enqueue(NewJob::new(JobType::IngestRange, ctx.chain_id, key("success")).with_range(1, 5))
         .expect("insert job");
 
     let leased = ctx
         .repo
-        .lease_next("worker-a", Duration::seconds(60))
+        .lease_next_for_type_and_chain(
+            "worker-a",
+            Duration::seconds(60),
+            JobType::IngestRange,
+            ctx.chain_id,
+        )
         .expect("lease query")
         .expect("leased job");
     let running = ctx.repo.mark_running(leased.id).expect("mark running");

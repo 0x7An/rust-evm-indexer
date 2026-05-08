@@ -91,7 +91,7 @@ impl IngestWorker {
                 })
             }
             Err(error) => {
-                let message = error.to_string();
+                let message = format_error_chain(&error);
                 let failed = self
                     .repositories
                     .jobs()
@@ -190,6 +190,14 @@ impl IngestWorker {
 
         Ok(summary)
     }
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
