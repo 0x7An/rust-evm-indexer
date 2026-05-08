@@ -202,6 +202,15 @@ impl LedgerRepository {
         self.source_by_contract_conn(&mut conn, chain_id, contract_address)
     }
 
+    pub fn source_by_id(&self, source_id: Uuid) -> Result<Option<SourceRow>> {
+        let mut conn = self.connection()?;
+        sources::table
+            .filter(sources::id.eq(source_id))
+            .first(&mut conn)
+            .optional()
+            .context("load source by id")
+    }
+
     pub fn contract_summary(
         &self,
         chain_id: i64,

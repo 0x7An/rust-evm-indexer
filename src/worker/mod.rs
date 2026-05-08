@@ -1,3 +1,155 @@
-//! Thin job worker adapter.
-//!
-//! Durable job leasing and execution are implemented in later checkpoints.
+//! Thin job worker adapter for durable ingestion jobs.
+
+use anyhow::{Context, Result, bail};
+use chrono::Duration;
+use uuid::Uuid;
+
+use crate::{
+    application::ingest::ingest_source_range,
+    domain::job::{JobStatus, JobType},
+    infra::{
+        evm::rpc::EvmRpcClient,
+        postgres::{
+            ledger_repository::ScanSummary, models::JobRow, repositories::PostgresRepositories,
+        },
+    },
+};
+
+#[derive(Clone)]
+pub struct IngestWorker {
+    repositories: PostgresRepositories,
+    rpc: EvmRpcClient,
+    worker_id: String,
+    lease_for: Duration,
+    chunk_size: u64,
+}
+
+impl IngestWorker {
+    pub fn new(
+        repositories: PostgresRepositories,
+        rpc: EvmRpcClient,
+        worker_id: impl Into<String>,
+        lease_for: Duration,
+        chunk_size: u64,
+    ) -> Self {
+        Self {
+            repositories,
+            rpc,
+            worker_id: worker_id.into(),
+            lease_for,
+            chunk_size,
+        }
+    }
+
+    pub async fn run_once(&self) -> Result<WorkerOutcome> {
+        if self.chunk_size == 0 {
+            bail!("chunk-size must be greater than zero");
+        }
+
+        let Some(leased) = self
+            .repositories
+            .jobs()
+            .lease_next_for_type(&self.worker_id, self.lease_for, JobType::IngestRange)
+            .context("lease next job")?
+        else {
+            return Ok(WorkerOutcome::NoJob);
+        };
+
+        let running = self
+            .repositories
+            .jobs()
+            .mark_running(leased.id)
+            .context("mark job running")?;
+
+        match self.execute_job(&running).await {
+            Ok(summary) => {
+                let succeeded = self
+                    .repositories
+                    .jobs()
+                    .mark_succeeded(running.id)
+                    .context("mark job succeeded")?;
+                Ok(WorkerOutcome::Processed {
+                    job_id: succeeded.id,
+                    summary,
+                })
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let failed = self
+                    .repositories
+                    .jobs()
+                    .mark_failed(running.id, "IngestJobError", &message)
+                    .context("mark job failed")?;
+                Ok(WorkerOutcome::Failed {
+                    job_id: failed.id,
+                    status: failed.status,
+                    error: message,
+                })
+            }
+        }
+    }
+
+    async fn execute_job(&self, job: &JobRow) -> Result<ScanSummary> {
+        let job_type = job
+            .job_type
+            .parse::<JobType>()
+            .with_context(|| format!("parse job type {}", job.job_type))?;
+        if job_type != JobType::IngestRange {
+            bail!("unsupported worker job type {}", job.job_type);
+        }
+
+        let source_id = job.source_id.context("ingest job is missing source_id")?;
+        let from = job.from_block.context("ingest job is missing from_block")?;
+        let to = job.to_block.context("ingest job is missing to_block")?;
+        if from < 0 || to < 0 {
+            bail!("ingest job range cannot be negative");
+        }
+
+        let source = self
+            .repositories
+            .ledger()
+            .source_by_id(source_id)
+            .context("load ingest source")?
+            .context("ingest source not found")?;
+        if source.chain_id != job.chain_id {
+            bail!(
+                "job chain_id {} does not match source chain_id {}",
+                job.chain_id,
+                source.chain_id
+            );
+        }
+
+        ingest_source_range(
+            &self.rpc,
+            self.repositories.ledger(),
+            &source,
+            from as u64,
+            to as u64,
+            self.chunk_size,
+        )
+        .await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum WorkerOutcome {
+    NoJob,
+    Processed {
+        job_id: Uuid,
+        summary: ScanSummary,
+    },
+    Failed {
+        job_id: Uuid,
+        status: String,
+        error: String,
+    },
+}
+
+impl WorkerOutcome {
+    pub fn is_terminal_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed { status, .. } if status == JobStatus::DeadLettered.as_str()
+        )
+    }
+}

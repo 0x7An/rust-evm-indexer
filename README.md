@@ -92,7 +92,7 @@ Each checkpoint should keep the project buildable, include focused validation, a
 
 ## Current Status
 
-Checkpoint 6 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI that fetches ERC-20, ERC-721, or ERC-1155 transfer logs from an EVM RPC endpoint, and a read API for querying indexed ledger slices. Worker execution, replay, and observability will be introduced in later checkpoints.
+Checkpoint 7 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, durable ingest job enqueueing, a worker that leases and executes ingestion jobs, and a read API for querying indexed ledger slices. Replay and observability will be introduced in later checkpoints.
 
 ## Development
 
@@ -188,6 +188,35 @@ cargo run -- scan-contract \
 ```
 
 The default chunk size is 10 blocks so the command works with RPC providers that tightly limit `eth_getLogs` ranges. Increase `--chunk-size` when your provider plan allows wider log queries. The default `latest` end block resolves to `head - finality_confirmations`, and the command verifies that the contract has bytecode on the selected chain before printing decoded log counts, persisted ledger entries, minters, and current holders for the indexed block slice.
+
+## Durable Ingestion
+
+For the production-shaped path, enqueue a durable ingestion job instead of running the scan inline:
+
+```sh
+export DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs
+export EVM_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/your-api-key
+
+cargo run -- enqueue-contract \
+  --chain-name polygon-mainnet \
+  --chain-id 137 \
+  --finality-confirmations 256 \
+  --contract 0x2953399124f0cbb46d2cbacd8a89cf0599974963 \
+  --standard erc1155 \
+  --from-block 0x528e895 \
+  --to-block 0x528e895
+```
+
+Then run one worker lease/execution cycle:
+
+```sh
+cargo run -- worker run-once \
+  --worker-id local-worker \
+  --lease-seconds 300 \
+  --chunk-size 10
+```
+
+`enqueue-contract` resolves the finalized range, verifies contract bytecode, creates or updates the source, and inserts an idempotent `INGEST_RANGE` job. `worker run-once` leases the next available job, marks it running, executes the same decoder/persistence path as `scan-contract`, and marks the job succeeded or failed.
 
 ## HTTP API
 

@@ -133,6 +133,30 @@ fn non_expired_lease_is_not_claimed_twice() {
 }
 
 #[test]
+fn lease_next_for_type_skips_other_job_types() {
+    let ctx = setup();
+    ctx.repo
+        .enqueue(NewJob::new(JobType::BackfillRange, 84532, key("backfill")).with_range(1, 5))
+        .expect("insert backfill job");
+    let expected = ctx
+        .repo
+        .enqueue(NewJob::new(JobType::IngestRange, 84532, key("ingest")).with_range(10, 20))
+        .expect("insert ingest job");
+    let expected_id = match expected {
+        EnqueueResult::Inserted(job) | EnqueueResult::Existing(job) => job.id,
+    };
+
+    let leased = ctx
+        .repo
+        .lease_next_for_type("worker-a", Duration::seconds(60), JobType::IngestRange)
+        .expect("lease query")
+        .expect("leased ingest job");
+
+    assert_eq!(leased.id, expected_id);
+    assert_eq!(leased.job_type, JobType::IngestRange.to_string());
+}
+
+#[test]
 fn expired_lease_can_be_reclaimed() {
     let ctx = setup();
     ctx.repo
