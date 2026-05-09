@@ -23,6 +23,7 @@ pub struct ResolvedRange {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IngestOptions {
     pub include_transaction_receipts: bool,
+    pub progress: bool,
 }
 
 pub async fn resolve_finalized_range(
@@ -88,16 +89,17 @@ pub async fn ingest_source_range(
         );
     }
 
-    let mut logs = fetch_logs_in_chunks(
+    let mut logs = fetch_logs_in_chunks_with_progress(
         rpc,
         &source.contract_address,
         standard,
         from,
         to,
         chunk_size,
+        options.progress,
     )
     .await?;
-    attach_block_timestamps(rpc, &mut logs).await?;
+    attach_block_timestamps(rpc, &mut logs, options.progress).await?;
 
     let mut decoded = Vec::new();
     let mut transaction_hashes = BTreeSet::new();
@@ -107,13 +109,20 @@ pub async fn ingest_source_range(
             decoded.push((log, decoded_log));
         }
     }
+    if options.progress {
+        println!(
+            "Decoded {} matching transfer logs with {} unique transactions.",
+            decoded.len(),
+            transaction_hashes.len()
+        );
+    }
 
     let mut summary = ledger
         .persist_decoded_logs(source, &decoded)
         .context("persist ledger")?;
 
     if options.include_transaction_receipts {
-        let receipts = fetch_transaction_receipts(rpc, transaction_hashes)
+        let receipts = fetch_transaction_receipts(rpc, transaction_hashes, options.progress)
             .await
             .context("fetch transaction receipts")?;
         summary.transaction_receipts_persisted = ledger
@@ -132,16 +141,44 @@ pub async fn fetch_logs_in_chunks(
     to: u64,
     chunk_size: u64,
 ) -> Result<Vec<RpcLog>> {
+    fetch_logs_in_chunks_with_progress(rpc, contract, standard, from, to, chunk_size, false).await
+}
+
+async fn fetch_logs_in_chunks_with_progress(
+    rpc: &EvmRpcClient,
+    contract: &str,
+    standard: TokenStandard,
+    from: u64,
+    to: u64,
+    chunk_size: u64,
+    progress: bool,
+) -> Result<Vec<RpcLog>> {
+    if from > to {
+        bail!("from-block {from} cannot be greater than to-block {to}");
+    }
+    if chunk_size == 0 {
+        bail!("chunk-size must be greater than zero");
+    }
+
     let mut logs = Vec::new();
     let mut chunk_from = from;
+    let total_chunks = (((to - from) / chunk_size) + 1) as usize;
+    let mut chunk_number = 0usize;
 
     while chunk_from <= to {
         let chunk_to = chunk_from.saturating_add(chunk_size - 1).min(to);
+        chunk_number += 1;
         let chunk_logs = rpc
             .logs(contract, standard, chunk_from, chunk_to)
             .await
             .with_context(|| format!("fetch contract logs {chunk_from}..={chunk_to}"))?;
         logs.extend(chunk_logs);
+        if progress && should_report_progress(chunk_number, total_chunks) {
+            println!(
+                "Fetched log chunk {chunk_number}/{total_chunks} for blocks {chunk_from}..={chunk_to}; logs so far: {}.",
+                logs.len()
+            );
+        }
 
         if chunk_to == u64::MAX {
             break;
@@ -152,19 +189,35 @@ pub async fn fetch_logs_in_chunks(
     Ok(logs)
 }
 
-async fn attach_block_timestamps(rpc: &EvmRpcClient, logs: &mut [RpcLog]) -> Result<()> {
+async fn attach_block_timestamps(
+    rpc: &EvmRpcClient,
+    logs: &mut [RpcLog],
+    progress: bool,
+) -> Result<()> {
     let mut timestamps = BTreeMap::new();
     for log in logs.iter() {
         let block = parse_hex_u64(&log.block_number).context("parse log block number")?;
         timestamps.entry(block).or_insert(None);
     }
 
+    if progress && !timestamps.is_empty() {
+        println!(
+            "Fetching block timestamps for {} event blocks.",
+            timestamps.len()
+        );
+    }
+    let total_blocks = timestamps.len();
+    let mut block_number = 0;
     for (block, timestamp) in timestamps.iter_mut() {
+        block_number += 1;
         *timestamp = Some(
             rpc.block_timestamp(*block)
                 .await
                 .with_context(|| format!("fetch block timestamp for block {block}"))?,
         );
+        if progress && should_report_progress(block_number, total_blocks) {
+            println!("Fetched block timestamp {block_number}/{total_blocks}.");
+        }
     }
 
     for log in logs {
@@ -178,17 +231,30 @@ async fn attach_block_timestamps(rpc: &EvmRpcClient, logs: &mut [RpcLog]) -> Res
 async fn fetch_transaction_receipts(
     rpc: &EvmRpcClient,
     transaction_hashes: BTreeSet<String>,
+    progress: bool,
 ) -> Result<Vec<RpcTransactionReceipt>> {
     let mut receipts = Vec::with_capacity(transaction_hashes.len());
-    for transaction_hash in transaction_hashes {
+    let total_receipts = transaction_hashes.len();
+    if progress && total_receipts > 0 {
+        println!("Fetching transaction receipts for {total_receipts} unique transactions.");
+    }
+    for (index, transaction_hash) in transaction_hashes.into_iter().enumerate() {
         receipts.push(
             rpc.transaction_receipt(&transaction_hash)
                 .await
                 .with_context(|| format!("fetch transaction receipt {transaction_hash}"))?,
         );
+        let receipt_number = index + 1;
+        if progress && should_report_progress(receipt_number, total_receipts) {
+            println!("Fetched transaction receipt {receipt_number}/{total_receipts}.");
+        }
     }
 
     Ok(receipts)
+}
+
+fn should_report_progress(done: usize, total: usize) -> bool {
+    done == 1 || done == total || done % 100 == 0
 }
 
 pub fn parse_block_arg(value: &str, latest: u64) -> Result<u64> {

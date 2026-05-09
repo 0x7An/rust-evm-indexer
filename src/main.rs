@@ -583,6 +583,7 @@ async fn scan_contract(
         chunk_size,
         IngestOptions {
             include_transaction_receipts,
+            progress: true,
         },
     )
     .await?;
@@ -975,7 +976,8 @@ fn build_worker(
         Duration::seconds(lease_seconds),
         chunk_size,
     )
-    .with_transaction_receipts(include_transaction_receipts);
+    .with_transaction_receipts(include_transaction_receipts)
+    .with_progress(true);
     if let Some(chain_id) = chain_id {
         if chain_id <= 0 {
             bail!("chain-id must be greater than zero");

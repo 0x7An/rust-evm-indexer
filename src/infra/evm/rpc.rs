@@ -1,3 +1,5 @@
+use std::time::Duration as StdDuration;
+
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -38,7 +40,10 @@ pub struct EvmRpcClient {
 impl EvmRpcClient {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(StdDuration::from_secs(DEFAULT_RPC_TIMEOUT_SECONDS))
+                .build()
+                .expect("build EVM RPC HTTP client"),
             url: url.into(),
         }
     }
@@ -221,6 +226,8 @@ struct JsonRpcError {
     code: i64,
     message: String,
 }
+
+const DEFAULT_RPC_TIMEOUT_SECONDS: u64 = 60;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

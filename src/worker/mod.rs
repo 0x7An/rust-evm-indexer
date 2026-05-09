@@ -24,6 +24,7 @@ pub struct IngestWorker {
     chunk_size: u64,
     chain_id: Option<i64>,
     include_transaction_receipts: bool,
+    progress: bool,
 }
 
 impl IngestWorker {
@@ -42,6 +43,7 @@ impl IngestWorker {
             chunk_size,
             chain_id: None,
             include_transaction_receipts: false,
+            progress: false,
         }
     }
 
@@ -52,6 +54,11 @@ impl IngestWorker {
 
     pub fn with_transaction_receipts(mut self, include_transaction_receipts: bool) -> Self {
         self.include_transaction_receipts = include_transaction_receipts;
+        self
+    }
+
+    pub fn with_progress(mut self, progress: bool) -> Self {
+        self.progress = progress;
         self
     }
 
@@ -176,6 +183,7 @@ impl IngestWorker {
             self.chunk_size,
             IngestOptions {
                 include_transaction_receipts: self.include_transaction_receipts,
+                progress: self.progress,
             },
         )
         .await?;
