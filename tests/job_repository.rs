@@ -167,10 +167,8 @@ fn non_expired_lease_is_not_claimed_twice() {
 fn lease_next_for_type_skips_other_job_types() {
     let ctx = setup();
     ctx.repo
-        .enqueue(
-            NewJob::new(JobType::BackfillRange, ctx.chain_id, key("backfill")).with_range(1, 5),
-        )
-        .expect("insert backfill job");
+        .enqueue(NewJob::new(JobType::ReplayRange, ctx.chain_id, key("replay")).with_range(1, 5))
+        .expect("insert replay job");
     let expected = ctx
         .repo
         .enqueue(NewJob::new(JobType::IngestRange, ctx.chain_id, key("ingest")).with_range(10, 20))
@@ -208,11 +206,11 @@ fn status_counts_group_and_filter_jobs() {
         .expect("insert second ingest job");
     ctx.repo
         .enqueue(NewJob::new(
-            JobType::BackfillRange,
+            JobType::ReplayRange,
             chain_id,
-            key("status-backfill"),
+            key("status-replay"),
         ))
-        .expect("insert backfill job");
+        .expect("insert replay job");
     ctx.repo
         .enqueue(NewJob::new(
             JobType::IngestRange,

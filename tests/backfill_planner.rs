@@ -3,7 +3,7 @@ use std::sync::{Mutex, MutexGuard};
 use diesel::{Connection, PgConnection, RunQueryDsl, prelude::*};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use indexer_rs::{
-    application::backfill::{BackfillRange, plan_backfill_jobs},
+    application::backfill::{BackfillChunk, plan_backfill_jobs},
     domain::job::{JobStatus, JobType},
     infra::{
         evm::decoder::TokenStandard,
@@ -231,10 +231,10 @@ fn seed_source(ctx: &TestContext) -> indexer_rs::infra::postgres::models::Source
         .expect("ensure source")
 }
 
-fn ranges(values: &[(u64, u64)]) -> Vec<BackfillRange> {
+fn ranges(values: &[(u64, u64)]) -> Vec<BackfillChunk> {
     values
         .iter()
-        .map(|(from, to)| BackfillRange {
+        .map(|(from, to)| BackfillChunk {
             from: *from,
             to: *to,
         })

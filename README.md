@@ -282,11 +282,11 @@ Backfill jobs use `backfill:` idempotency keys based on `source_id`,
 jobs instead of duplicating work. The queue also enforces uniqueness for a
 source, job type, and block range, which prevents overlap with manually enqueued
 ingest jobs for the same range. These jobs are still `INGEST_RANGE` jobs because
-the command is used for initial/full-history ingestion; replay-oriented
-`BACKFILL_RANGE` and `REPLAY_RANGE` execution paths are later work. After a
-worker successfully ingests a range, it advances the checkpoint only across
-contiguous completed ranges, so progress does not skip gaps when jobs finish out
-of order.
+the command is used for initial/full-history ingestion. `BACKFILL_RANGE` is not
+an active job type; replay and repair work uses `REPLAY_RANGE` so the worker can
+apply audit-preserving orphan semantics. After a worker successfully ingests a
+range, it advances the checkpoint only across contiguous completed ranges, so
+progress does not skip gaps when jobs finish out of order.
 
 Newly ingested events persist both ingestion time and on-chain event metadata:
 `block_timestamp`, `transaction_index`, raw `topics`, and raw `data`. If rows were

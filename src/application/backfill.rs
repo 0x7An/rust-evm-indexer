@@ -11,7 +11,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BackfillRange {
+pub struct BackfillChunk {
     pub from: u64,
     pub to: u64,
 }
@@ -24,7 +24,7 @@ pub struct BackfillPlan {
     pub planned_from: Option<u64>,
     pub planned_to: Option<u64>,
     pub range_size: u64,
-    pub ranges: Vec<BackfillRange>,
+    pub ranges: Vec<BackfillChunk>,
     pub inserted_jobs: usize,
     pub existing_jobs: usize,
 }
@@ -108,7 +108,7 @@ pub fn plan_backfill_jobs(
     })
 }
 
-pub fn split_inclusive_range(from: u64, to: u64, range_size: u64) -> Result<Vec<BackfillRange>> {
+pub fn split_inclusive_range(from: u64, to: u64, range_size: u64) -> Result<Vec<BackfillChunk>> {
     if from > to {
         bail!("from-block {from} cannot be greater than to-block {to}");
     }
@@ -120,7 +120,7 @@ pub fn split_inclusive_range(from: u64, to: u64, range_size: u64) -> Result<Vec<
     let mut range_from = from;
     while range_from <= to {
         let range_to = range_from.saturating_add(range_size - 1).min(to);
-        ranges.push(BackfillRange {
+        ranges.push(BackfillChunk {
             from: range_from,
             to: range_to,
         });

@@ -120,7 +120,7 @@ CREATE TABLE jobs (
     error_message TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (job_type IN ('INGEST_RANGE', 'BACKFILL_RANGE', 'REPLAY_RANGE', 'VERIFY_REORG', 'REPAIR_CHECKPOINT')),
+    CHECK (job_type IN ('INGEST_RANGE', 'REPLAY_RANGE', 'VERIFY_REORG', 'REPAIR_CHECKPOINT')),
     CHECK (status IN ('queued', 'leased', 'running', 'succeeded', 'failed', 'dead_lettered', 'cancelled')),
     CHECK (from_block IS NULL OR from_block >= 0),
     CHECK (to_block IS NULL OR to_block >= 0),

@@ -18,7 +18,6 @@ impl JobId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobType {
     IngestRange,
-    BackfillRange,
     ReplayRange,
     VerifyReorg,
     RepairCheckpoint,
@@ -28,7 +27,6 @@ impl JobType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::IngestRange => "INGEST_RANGE",
-            Self::BackfillRange => "BACKFILL_RANGE",
             Self::ReplayRange => "REPLAY_RANGE",
             Self::VerifyReorg => "VERIFY_REORG",
             Self::RepairCheckpoint => "REPAIR_CHECKPOINT",
@@ -48,7 +46,6 @@ impl FromStr for JobType {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "INGEST_RANGE" => Ok(Self::IngestRange),
-            "BACKFILL_RANGE" => Ok(Self::BackfillRange),
             "REPLAY_RANGE" => Ok(Self::ReplayRange),
             "VERIFY_REORG" => Ok(Self::VerifyReorg),
             "REPAIR_CHECKPOINT" => Ok(Self::RepairCheckpoint),
@@ -157,6 +154,11 @@ mod tests {
             "INGEST_RANGE".parse::<JobType>().unwrap(),
             JobType::IngestRange
         );
+        assert_eq!(
+            "REPLAY_RANGE".parse::<JobType>().unwrap(),
+            JobType::ReplayRange
+        );
+        assert!("BACKFILL_RANGE".parse::<JobType>().is_err());
         assert!("UNKNOWN".parse::<JobType>().is_err());
     }
 
