@@ -412,6 +412,68 @@ async fn rejects_balance_updates_that_would_go_negative() {
     assert!(path.is_empty());
 }
 
+#[tokio::test]
+async fn reprocessing_orphaned_rows_does_not_unorphan_them() {
+    let ctx = setup();
+    let repo = LedgerRepository::new(ctx.pool.clone());
+    let source = repo
+        .source_by_contract(ctx.chain_id, &ctx.contract)
+        .expect("load source")
+        .expect("source exists");
+    let transaction_hash = format!("0x{}", "01".repeat(32));
+
+    {
+        let mut conn = ctx.pool.get().expect("get postgres connection");
+        diesel::update(
+            events::table
+                .filter(events::chain_id.eq(ctx.chain_id))
+                .filter(events::transaction_hash.eq(&transaction_hash))
+                .filter(events::log_index.eq(0)),
+        )
+        .set(events::orphaned.eq(true))
+        .execute(&mut conn)
+        .expect("mark event orphaned");
+        diesel::update(
+            ledger_entries::table
+                .filter(ledger_entries::chain_id.eq(ctx.chain_id))
+                .filter(ledger_entries::transaction_hash.eq(&transaction_hash))
+                .filter(ledger_entries::log_index.eq(0))
+                .filter(ledger_entries::batch_index.eq(0)),
+        )
+        .set(ledger_entries::orphaned.eq(true))
+        .execute(&mut conn)
+        .expect("mark ledger entry orphaned");
+    }
+
+    let logs = vec![transfer_log(
+        &ctx.contract,
+        100,
+        "01",
+        0,
+        &zero_address(),
+        &address("11"),
+        "42",
+    )];
+    repo.persist_decoded_logs(&source, &logs)
+        .expect("reprocess orphaned log");
+
+    let mut conn = ctx.pool.get().expect("get postgres connection");
+    let event_orphaned = events::table
+        .filter(events::chain_id.eq(ctx.chain_id))
+        .filter(events::transaction_hash.eq(&transaction_hash))
+        .select(events::orphaned)
+        .first::<bool>(&mut conn)
+        .expect("load event orphaned flag");
+    let ledger_orphaned = ledger_entries::table
+        .filter(ledger_entries::chain_id.eq(ctx.chain_id))
+        .filter(ledger_entries::transaction_hash.eq(&transaction_hash))
+        .select(ledger_entries::orphaned)
+        .first::<bool>(&mut conn)
+        .expect("load ledger orphaned flag");
+    assert!(event_orphaned);
+    assert!(ledger_orphaned);
+}
+
 async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
     let response = app
         .clone()

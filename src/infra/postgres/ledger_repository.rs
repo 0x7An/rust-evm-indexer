@@ -834,7 +834,6 @@ impl LedgerRepository {
                 events::data.eq(excluded(events::data)),
                 events::args.eq(excluded(events::args)),
                 events::finalized.eq(true),
-                events::orphaned.eq(false),
             ))
             .get_result::<super::models::EventRow>(conn)
             .context("upsert event")?;
@@ -912,7 +911,6 @@ impl LedgerRepository {
                 ledger_entries::block_timestamp.eq(excluded(ledger_entries::block_timestamp)),
                 ledger_entries::block_hash.eq(excluded(ledger_entries::block_hash)),
                 ledger_entries::transaction_index.eq(excluded(ledger_entries::transaction_index)),
-                ledger_entries::orphaned.eq(false),
             ))
             .get_result::<LedgerEntryRow>(conn)
             .context("upsert ledger entry")?;
