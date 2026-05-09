@@ -254,7 +254,7 @@ async fn fetch_transaction_receipts(
 }
 
 fn should_report_progress(done: usize, total: usize) -> bool {
-    done == 1 || done == total || done % 100 == 0
+    done == 1 || done == total || done.is_multiple_of(100)
 }
 
 pub fn parse_block_arg(value: &str, latest: u64) -> Result<u64> {

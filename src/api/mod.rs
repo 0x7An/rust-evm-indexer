@@ -187,22 +187,22 @@ struct LedgerPageQuery {
 impl LedgerPageQuery {
     fn to_ledger_query(&self, default_limit: i64) -> ApiResult<LedgerQuery> {
         let limit = LimitQuery { limit: self.limit }.limit_or_default(default_limit)?;
-        if let Some(from_block) = self.from_block {
-            if from_block < 0 {
-                return Err(ApiError::bad_request("from_block cannot be negative"));
-            }
+        if let Some(from_block) = self.from_block
+            && from_block < 0
+        {
+            return Err(ApiError::bad_request("from_block cannot be negative"));
         }
-        if let Some(to_block) = self.to_block {
-            if to_block < 0 {
-                return Err(ApiError::bad_request("to_block cannot be negative"));
-            }
+        if let Some(to_block) = self.to_block
+            && to_block < 0
+        {
+            return Err(ApiError::bad_request("to_block cannot be negative"));
         }
-        if let (Some(from_block), Some(to_block)) = (self.from_block, self.to_block) {
-            if from_block > to_block {
-                return Err(ApiError::bad_request(
-                    "from_block cannot be greater than to_block",
-                ));
-            }
+        if let (Some(from_block), Some(to_block)) = (self.from_block, self.to_block)
+            && from_block > to_block
+        {
+            return Err(ApiError::bad_request(
+                "from_block cannot be greater than to_block",
+            ));
         }
 
         Ok(LedgerQuery {

@@ -262,7 +262,7 @@ fn decode_data_words(data: &str) -> Result<Vec<String>> {
 }
 
 fn decode_dynamic_uint_array(words: &[String], offset_bytes: usize) -> Result<Vec<String>> {
-    if offset_bytes % 32 != 0 {
+    if !offset_bytes.is_multiple_of(32) {
         bail!("dynamic array offset must be 32-byte aligned");
     }
     let start = offset_bytes / 32;

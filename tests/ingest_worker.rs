@@ -170,7 +170,7 @@ async fn worker_processes_queued_ingest_job() {
     assert_eq!(contract_summary.ledger_entry_count, 1);
     assert_eq!(contract_summary.holder_count, 1);
     assert_eq!(contract_summary.checkpoint_processed_block, Some(100));
-    assert_eq!(contract_summary.checkpoint_finalized_block, Some(100));
+    assert_eq!(contract_summary.checkpoint_finalized_block, Some(108));
 
     let mut conn = ctx.pool.get().expect("get postgres connection");
     let (block_timestamp, transaction_index, topics, data) = events::table
@@ -199,7 +199,7 @@ async fn worker_processes_queued_ingest_job() {
         checkpoint.processed_block_hash,
         format!("0x{}", "ef".repeat(32))
     );
-    assert_eq!(checkpoint.finalized_block, 100);
+    assert_eq!(checkpoint.finalized_block, 108);
 }
 
 #[tokio::test]
@@ -435,7 +435,7 @@ async fn fake_rpc_handler(
     Json(request): Json<JsonRpcRequest>,
 ) -> Json<Value> {
     let result = match request.method.as_str() {
-        "eth_blockNumber" => json!("0x70"),
+        "eth_blockNumber" => json!("0x78"),
         "eth_getCode" => json!("0x6000"),
         "eth_getBlockByNumber" => json!({
             "hash": format!("0x{}", "ef".repeat(32)),

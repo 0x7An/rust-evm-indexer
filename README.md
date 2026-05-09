@@ -105,6 +105,7 @@ Checkpoint 12 is complete. The project currently contains the public Rust skelet
 cargo fmt
 cargo check
 cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
 `cargo test` includes Postgres-backed job repository integration tests. Start
@@ -276,7 +277,16 @@ cargo run -- backfill-contract \
   --range-size 100
 ```
 
-Backfill jobs use idempotency keys based on `source_id`, `from_block`, and `to_block`, so rerunning the same command reports existing jobs instead of duplicating work. After a worker successfully ingests a range, it advances the checkpoint only across contiguous completed ranges, so progress does not skip gaps when jobs finish out of order.
+Backfill jobs use `backfill:` idempotency keys based on `source_id`,
+`from_block`, and `to_block`, so rerunning the same command reports existing
+jobs instead of duplicating work. The queue also enforces uniqueness for a
+source, job type, and block range, which prevents overlap with manually enqueued
+ingest jobs for the same range. These jobs are still `INGEST_RANGE` jobs because
+the command is used for initial/full-history ingestion; replay-oriented
+`BACKFILL_RANGE` and `REPLAY_RANGE` execution paths are later work. After a
+worker successfully ingests a range, it advances the checkpoint only across
+contiguous completed ranges, so progress does not skip gaps when jobs finish out
+of order.
 
 Newly ingested events persist both ingestion time and on-chain event metadata:
 `block_timestamp`, `transaction_index`, raw `topics`, and raw `data`. If rows were

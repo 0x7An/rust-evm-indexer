@@ -175,10 +175,10 @@ impl EvmRpcClient {
         let rpc_response = serde_json::from_str::<JsonRpcResponse>(&body);
 
         if !status.is_success() {
-            if let Ok(response) = rpc_response {
-                if let Some(error) = response.error {
-                    bail!("RPC {method} error {}: {}", error.code, error.message);
-                }
+            if let Ok(response) = rpc_response
+                && let Some(error) = response.error
+            {
+                bail!("RPC {method} error {}: {}", error.code, error.message);
             }
             bail!(
                 "RPC {method} HTTP status {status}: {}",

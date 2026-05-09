@@ -1,0 +1,1 @@
+DROP INDEX idx_jobs_unique_source_type_range;

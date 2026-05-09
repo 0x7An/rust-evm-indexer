@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use bigdecimal::{BigDecimal, Zero};
+use bigdecimal::{
+    BigDecimal, Zero,
+    num_bigint::{BigInt, BigUint},
+};
 use chrono::{DateTime, Utc};
 use diesel::{
     PgConnection, QueryableByName,
     prelude::*,
-    sql_types::{BigInt, Text as SqlText, Uuid as SqlUuid},
+    sql_types::{BigInt as SqlBigInt, Text as SqlText, Uuid as SqlUuid},
     upsert::excluded,
 };
 use serde::Serialize;
@@ -14,7 +17,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    domain::job::JobStatus,
+    domain::job::{JobStatus, JobType},
     infra::evm::{
         decoder::{DecodedLog, RpcLog, TokenStandard, parse_hex_u64},
         rpc::RpcTransactionReceipt,
@@ -177,6 +180,15 @@ impl LedgerRepository {
             .context("upsert chain")
     }
 
+    pub fn chain_by_chain_id(&self, chain_id: i64) -> Result<Option<ChainRow>> {
+        let mut conn = self.connection()?;
+        chains::table
+            .filter(chains::chain_id.eq(chain_id))
+            .first::<ChainRow>(&mut conn)
+            .optional()
+            .context("load chain by chain_id")
+    }
+
     pub fn ensure_source(
         &self,
         chain_id: i64,
@@ -297,7 +309,7 @@ impl LedgerRepository {
              LIMIT $2",
         )
         .bind::<SqlUuid, _>(source_id)
-        .bind::<BigInt, _>(limit.clamp(1, 10_000))
+        .bind::<SqlBigInt, _>(limit.clamp(1, 10_000))
         .load::<MissingReceiptHashRow>(&mut conn)
         .map(|rows| rows.into_iter().map(|row| row.transaction_hash).collect())
         .context("load transaction hashes missing receipts")
@@ -500,7 +512,12 @@ impl LedgerRepository {
 
             let mut ranges = jobs::table
                 .filter(jobs::source_id.eq(Some(source.id)))
+                .filter(jobs::job_type.eq(JobType::IngestRange.to_string()))
                 .filter(jobs::status.eq(JobStatus::Succeeded.to_string()))
+                .filter(jobs::from_block.is_not_null())
+                .filter(jobs::to_block.is_not_null())
+                .filter(jobs::to_block.gt(Some(frontier)))
+                .order((jobs::from_block.asc(), jobs::to_block.asc()))
                 .select((jobs::from_block, jobs::to_block))
                 .load::<(Option<i64>, Option<i64>)>(conn)
                 .context("load succeeded ranges for checkpoint")?
@@ -1268,7 +1285,17 @@ fn parse_optional_hex_big_decimal(value: Option<&str>) -> Result<Option<BigDecim
 }
 
 fn parse_hex_big_decimal(value: &str) -> Result<BigDecimal> {
-    Ok(BigDecimal::from(parse_hex_u64(value)?))
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.is_empty() {
+        anyhow::bail!("hex value {value} is empty");
+    }
+
+    let parsed = BigUint::parse_bytes(digits.as_bytes(), 16)
+        .with_context(|| format!("parse hex numeric: {value}"))?;
+    Ok(BigDecimal::from(BigInt::from(parsed)))
 }
 
 fn normalized_topics(log: &RpcLog) -> serde_json::Value {

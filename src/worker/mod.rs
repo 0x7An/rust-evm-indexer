@@ -225,6 +225,12 @@ impl IngestWorker {
                 source.chain_id
             );
         }
+        let observed_finalized_block = self.observed_finalized_block(source.chain_id).await?;
+        if to > observed_finalized_block {
+            bail!(
+                "job target block {to} is newer than observed finalized block {observed_finalized_block}"
+            );
+        }
 
         let summary = ingest_source_range(
             &self.rpc,
@@ -240,25 +246,48 @@ impl IngestWorker {
         )
         .await?;
 
-        let mut completed_range = Some((from, to));
-        while let Some(target) = self
+        if let Some(target) = self
             .repositories
             .ledger()
-            .next_contiguous_checkpoint_target(&source, completed_range)
+            .next_contiguous_checkpoint_target(&source, Some((from, to)))
             .context("compute checkpoint target")?
         {
+            if target > observed_finalized_block {
+                return Ok(summary);
+            }
+
             let processed_block_hash =
                 self.rpc.block_hash(target as u64).await.with_context(|| {
                     format!("fetch block hash for checkpoint at block {target}")
                 })?;
             self.repositories
                 .ledger()
-                .advance_checkpoint(source.id, target, &processed_block_hash, target)
+                .advance_checkpoint(
+                    source.id,
+                    target,
+                    &processed_block_hash,
+                    observed_finalized_block,
+                )
                 .context("advance source checkpoint")?;
-            completed_range = None;
         }
 
         Ok(summary)
+    }
+
+    async fn observed_finalized_block(&self, chain_id: i64) -> Result<i64> {
+        let chain = self
+            .repositories
+            .ledger()
+            .chain_by_chain_id(chain_id)
+            .context("load chain for finalized checkpoint")?
+            .context("chain configuration not found")?;
+        if chain.finality_confirmations < 0 {
+            bail!("chain finality_confirmations cannot be negative");
+        }
+
+        let head = self.rpc.block_number().await.context("fetch head block")?;
+        let finalized = head.saturating_sub(chain.finality_confirmations as u64);
+        i64::try_from(finalized).context("finalized block exceeds postgres bigint storage")
     }
 }
 

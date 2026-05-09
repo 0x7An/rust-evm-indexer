@@ -106,22 +106,46 @@ impl JobRepository {
     pub fn enqueue(&self, job: NewJob) -> QueryResult<EnqueueResult> {
         let mut conn = self.connection()?;
         let new_row = NewJobRow::from(job);
-        let key = new_row.idempotency_key.clone();
 
         let inserted = diesel::insert_into(jobs::table)
             .values(&new_row)
-            .on_conflict(jobs::idempotency_key)
-            .do_nothing()
+            .on_conflict_do_nothing()
             .get_result::<JobRow>(&mut conn)
             .optional()?;
 
         match inserted {
             Some(row) => Ok(EnqueueResult::Inserted(row)),
-            None => jobs::table
-                .filter(jobs::idempotency_key.eq(key))
-                .first::<JobRow>(&mut conn)
+            None => self
+                .existing_enqueue_conflict(&mut conn, &new_row)
                 .map(EnqueueResult::Existing),
         }
+    }
+
+    fn existing_enqueue_conflict(
+        &self,
+        conn: &mut PgConnection,
+        new_row: &NewJobRow,
+    ) -> QueryResult<JobRow> {
+        let by_idempotency_key = jobs::table
+            .filter(jobs::idempotency_key.eq(&new_row.idempotency_key))
+            .first::<JobRow>(conn)
+            .optional()?;
+        if let Some(row) = by_idempotency_key {
+            return Ok(row);
+        }
+
+        if let (Some(source_id), Some(from_block), Some(to_block)) =
+            (new_row.source_id, new_row.from_block, new_row.to_block)
+        {
+            return jobs::table
+                .filter(jobs::source_id.eq(Some(source_id)))
+                .filter(jobs::job_type.eq(&new_row.job_type))
+                .filter(jobs::from_block.eq(Some(from_block)))
+                .filter(jobs::to_block.eq(Some(to_block)))
+                .first::<JobRow>(conn);
+        }
+
+        Err(diesel::result::Error::NotFound)
     }
 
     pub fn lease_next(&self, worker_id: &str, lease_for: Duration) -> QueryResult<Option<JobRow>> {
@@ -514,11 +538,11 @@ impl JobRepository {
 }
 
 trait JobStatusExt {
-    fn is_terminal(self) -> bool;
+    fn is_terminal(&self) -> bool;
 }
 
 impl JobStatusExt for JobStatus {
-    fn is_terminal(self) -> bool {
+    fn is_terminal(&self) -> bool {
         matches!(
             self,
             JobStatus::Succeeded

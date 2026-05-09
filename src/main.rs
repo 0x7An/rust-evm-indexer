@@ -378,7 +378,7 @@ async fn main() -> Result<()> {
         } => {
             let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
 
-            scan_contract(
+            scan_contract(ScanContractArgs {
                 rpc_url,
                 database_url,
                 chain_name,
@@ -391,7 +391,7 @@ async fn main() -> Result<()> {
                 lookback,
                 chunk_size,
                 include_transaction_receipts,
-            )
+            })
             .await
         }
         Commands::EnqueueContract {
@@ -409,7 +409,7 @@ async fn main() -> Result<()> {
         } => {
             let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
 
-            enqueue_contract(
+            enqueue_contract(EnqueueContractArgs {
                 rpc_url,
                 database_url,
                 chain_name,
@@ -421,7 +421,7 @@ async fn main() -> Result<()> {
                 to_block,
                 lookback,
                 max_attempts,
-            )
+            })
             .await
         }
         Commands::BackfillContract {
@@ -440,7 +440,7 @@ async fn main() -> Result<()> {
         } => {
             let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
 
-            backfill_contract(
+            backfill_contract(BackfillContractArgs {
                 rpc_url,
                 database_url,
                 chain_name,
@@ -453,7 +453,7 @@ async fn main() -> Result<()> {
                 lookback,
                 range_size,
                 max_attempts,
-            )
+            })
             .await
         }
         Commands::BackfillEventMetadata {
@@ -560,7 +560,7 @@ async fn serve_api(database_url: String, bind: SocketAddr) -> Result<()> {
     axum::serve(listener, app).await.context("serve HTTP API")
 }
 
-async fn scan_contract(
+struct ScanContractArgs {
     rpc_url: String,
     database_url: String,
     chain_name: String,
@@ -573,7 +573,24 @@ async fn scan_contract(
     lookback: u64,
     chunk_size: u64,
     include_transaction_receipts: bool,
-) -> Result<()> {
+}
+
+async fn scan_contract(args: ScanContractArgs) -> Result<()> {
+    let ScanContractArgs {
+        rpc_url,
+        database_url,
+        chain_name,
+        chain_id,
+        finality_confirmations,
+        contract,
+        standard,
+        from_block,
+        to_block,
+        lookback,
+        chunk_size,
+        include_transaction_receipts,
+    } = args;
+
     let standard = standard
         .parse::<TokenStandard>()
         .with_context(|| format!("parse token standard {standard}"))?;
@@ -652,7 +669,7 @@ async fn scan_contract(
     Ok(())
 }
 
-async fn enqueue_contract(
+struct EnqueueContractArgs {
     rpc_url: String,
     database_url: String,
     chain_name: String,
@@ -664,7 +681,23 @@ async fn enqueue_contract(
     to_block: String,
     lookback: u64,
     max_attempts: i32,
-) -> Result<()> {
+}
+
+async fn enqueue_contract(args: EnqueueContractArgs) -> Result<()> {
+    let EnqueueContractArgs {
+        rpc_url,
+        database_url,
+        chain_name,
+        chain_id,
+        finality_confirmations,
+        contract,
+        standard,
+        from_block,
+        to_block,
+        lookback,
+        max_attempts,
+    } = args;
+
     let standard = standard
         .parse::<TokenStandard>()
         .with_context(|| format!("parse token standard {standard}"))?;
@@ -747,7 +780,7 @@ async fn enqueue_contract(
     Ok(())
 }
 
-async fn backfill_contract(
+struct BackfillContractArgs {
     rpc_url: String,
     database_url: String,
     chain_name: String,
@@ -760,7 +793,24 @@ async fn backfill_contract(
     lookback: u64,
     range_size: u64,
     max_attempts: i32,
-) -> Result<()> {
+}
+
+async fn backfill_contract(args: BackfillContractArgs) -> Result<()> {
+    let BackfillContractArgs {
+        rpc_url,
+        database_url,
+        chain_name,
+        chain_id,
+        finality_confirmations,
+        contract,
+        standard,
+        from_block,
+        to_block,
+        lookback,
+        range_size,
+        max_attempts,
+    } = args;
+
     let standard = standard
         .parse::<TokenStandard>()
         .with_context(|| format!("parse token standard {standard}"))?;
@@ -960,7 +1010,7 @@ async fn backfill_transaction_receipts(
         );
         fetched += 1;
 
-        if fetched == 1 || fetched == total || fetched % 100 == 0 {
+        if fetched == 1 || fetched == total || fetched.is_multiple_of(100) {
             println!("Fetched transaction receipt {fetched}/{total}.");
         }
 
@@ -1014,10 +1064,10 @@ async fn worker_run_once(
 
     let outcome = worker.run_once_until_shutdown(shutdown_signal()).await?;
     print_worker_outcome(&outcome);
-    if outcome.is_terminal_failure() {
-        if let WorkerOutcome::Failed { job_id, .. } = outcome {
-            bail!("ingest job {job_id} is dead-lettered");
-        }
+    if outcome.is_terminal_failure()
+        && let WorkerOutcome::Failed { job_id, .. } = outcome
+    {
+        bail!("ingest job {job_id} is dead-lettered");
     }
 
     Ok(())
@@ -1134,7 +1184,7 @@ fn print_worker_outcome(outcome: &WorkerOutcome) {
         WorkerOutcome::NoJob => println!("No queued jobs available."),
         WorkerOutcome::Processed { job_id, summary } => {
             println!("Processed ingest job {job_id}.");
-            print_scan_summary(&summary);
+            print_scan_summary(summary);
         }
         WorkerOutcome::Failed {
             job_id,
@@ -1267,10 +1317,10 @@ fn rpc_url_from_args(value: Option<String>, chain_id: Option<i64>) -> Result<Str
 }
 
 fn rpc_url_from_env(chain_id: Option<i64>) -> Result<String> {
-    if let Some(env_name) = chain_rpc_env_name(chain_id) {
-        if let Ok(value) = std::env::var(env_name) {
-            return Ok(value);
-        }
+    if let Some(env_name) = chain_rpc_env_name(chain_id)
+        && let Ok(value) = std::env::var(env_name)
+    {
+        return Ok(value);
     }
 
     std::env::var("EVM_RPC_URL")

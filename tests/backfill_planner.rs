@@ -4,11 +4,12 @@ use diesel::{Connection, PgConnection, RunQueryDsl, prelude::*};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use indexer_rs::{
     application::backfill::{BackfillRange, plan_backfill_jobs},
-    domain::job::JobStatus,
+    domain::job::{JobStatus, JobType},
     infra::{
         evm::decoder::TokenStandard,
         postgres::{
             connection::{PgPool, build_pool},
+            job_repository::{EnqueueResult, NewJob},
             repositories::PostgresRepositories,
             schema::{chains, jobs, sources},
         },
@@ -111,6 +112,10 @@ fn backfill_creates_deterministic_idempotent_jobs() {
         jobs.iter()
             .all(|job| job.status == JobStatus::Queued.to_string())
     );
+    assert!(
+        jobs.iter()
+            .all(|job| job.idempotency_key.starts_with("backfill:"))
+    );
 }
 
 #[test]
@@ -166,6 +171,42 @@ fn checkpoint_target_waits_for_contiguous_ranges() {
         .next_contiguous_checkpoint_target(&source, Some((100, 199)))
         .expect("compute catch-up checkpoint target");
     assert_eq!(target, Some(299));
+}
+
+#[test]
+fn backfill_reuses_existing_ingest_range_job() {
+    let ctx = setup();
+    let source = seed_source(&ctx);
+    let existing = ctx
+        .repositories
+        .jobs()
+        .enqueue(
+            NewJob::new(
+                JobType::IngestRange,
+                ctx.chain_id,
+                format!("ingest:{}:100:103", source.id),
+            )
+            .with_source(source.id)
+            .with_range(100, 103),
+        )
+        .expect("enqueue existing ingest job");
+    let existing_id = match existing {
+        EnqueueResult::Inserted(job) | EnqueueResult::Existing(job) => job.id,
+    };
+
+    let plan =
+        plan_backfill_jobs(&ctx.repositories, &source, 100, 103, 4, 3).expect("plan backfill jobs");
+    assert_eq!(plan.inserted_jobs, 0);
+    assert_eq!(plan.existing_jobs, 1);
+
+    let jobs = ctx
+        .repositories
+        .jobs()
+        .jobs_for_source(source.id)
+        .expect("load planned jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, existing_id);
+    assert!(jobs[0].idempotency_key.starts_with("ingest:"));
 }
 
 fn seed_source(ctx: &TestContext) -> indexer_rs::infra::postgres::models::SourceRow {

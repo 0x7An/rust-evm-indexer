@@ -78,7 +78,7 @@ pub fn plan_backfill_jobs(
     let mut existing_jobs = 0;
 
     for range in &ranges {
-        let idempotency_key = format!("ingest:{}:{}:{}", source.id, range.from, range.to);
+        let idempotency_key = format!("backfill:{}:{}:{}", source.id, range.from, range.to);
         let result = repositories
             .jobs()
             .enqueue(

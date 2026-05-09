@@ -459,7 +459,7 @@ fn receipt(contract: &str, tx_hash: &str, block_number: u64) -> RpcTransactionRe
         status: Some("0x1".to_string()),
         gas_used: "0x5208".to_string(),
         cumulative_gas_used: "0x5208".to_string(),
-        effective_gas_price: Some("0x3b9aca00".to_string()),
+        effective_gas_price: Some("0x10000000000000000".to_string()),
         transaction_type: Some("0x2".to_string()),
         raw: json!({ "transactionHash": tx_hash }),
     }

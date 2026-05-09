@@ -153,20 +153,36 @@ pub struct LedgerEntry {
     pub contract_address: Address,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerEntryInput {
+    pub identity: LedgerEntryIdentity,
+    pub source_id: SourceId,
+    pub token_standard: TokenStandard,
+    pub operator: Option<Address>,
+    pub from: Address,
+    pub to: Address,
+    pub token_id: TokenId,
+    pub amount: TokenAmount,
+    pub block_number: BlockNumber,
+    pub block_hash: BlockHash,
+    pub contract_address: Address,
+}
+
 impl LedgerEntry {
-    pub fn new(
-        identity: LedgerEntryIdentity,
-        source_id: SourceId,
-        token_standard: TokenStandard,
-        operator: Option<Address>,
-        from: Address,
-        to: Address,
-        token_id: TokenId,
-        amount: TokenAmount,
-        block_number: BlockNumber,
-        block_hash: BlockHash,
-        contract_address: Address,
-    ) -> DomainResult<Self> {
+    pub fn new(input: LedgerEntryInput) -> DomainResult<Self> {
+        let LedgerEntryInput {
+            identity,
+            source_id,
+            token_standard,
+            operator,
+            from,
+            to,
+            token_id,
+            amount,
+            block_number,
+            block_hash,
+            contract_address,
+        } = input;
         let movement_type = MovementType::from_participants(&from, &to)?;
         let from = (!from.is_zero()).then_some(from);
         let to = (!to.is_zero()).then_some(to);
@@ -219,6 +235,22 @@ mod tests {
         )
     }
 
+    fn ledger_entry_input(from: Address, to: Address) -> LedgerEntryInput {
+        LedgerEntryInput {
+            identity: identity(0),
+            source_id: SourceId::new("source-1").unwrap(),
+            token_standard: TokenStandard::Erc721,
+            operator: None,
+            from,
+            to,
+            token_id: TokenId::new("42").unwrap(),
+            amount: TokenAmount::one(),
+            block_number: BlockNumber::new(100),
+            block_hash: block_hash(),
+            contract_address: address("66"),
+        }
+    }
+
     #[test]
     fn event_identity_uses_chain_transaction_and_log_index() {
         let a = EventIdentity::new(ChainId::new(1), tx_hash(), LogIndex::new(7));
@@ -237,20 +269,7 @@ mod tests {
 
     #[test]
     fn ledger_entry_infers_mint_and_drops_zero_sender() {
-        let entry = LedgerEntry::new(
-            identity(0),
-            SourceId::new("source-1").unwrap(),
-            TokenStandard::Erc721,
-            None,
-            Address::zero(),
-            address("55"),
-            TokenId::new("42").unwrap(),
-            TokenAmount::one(),
-            BlockNumber::new(100),
-            block_hash(),
-            address("66"),
-        )
-        .unwrap();
+        let entry = LedgerEntry::new(ledger_entry_input(Address::zero(), address("55"))).unwrap();
 
         assert_eq!(entry.movement_type, MovementType::Mint);
         assert!(entry.from.is_none());
@@ -259,20 +278,8 @@ mod tests {
 
     #[test]
     fn ledger_entry_rejects_zero_to_zero_movement() {
-        let err = LedgerEntry::new(
-            identity(0),
-            SourceId::new("source-1").unwrap(),
-            TokenStandard::Erc721,
-            None,
-            Address::zero(),
-            Address::zero(),
-            TokenId::new("42").unwrap(),
-            TokenAmount::one(),
-            BlockNumber::new(100),
-            block_hash(),
-            address("66"),
-        )
-        .unwrap_err();
+        let err =
+            LedgerEntry::new(ledger_entry_input(Address::zero(), Address::zero())).unwrap_err();
 
         assert_eq!(
             err,
