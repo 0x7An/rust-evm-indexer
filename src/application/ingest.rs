@@ -22,11 +22,31 @@ pub struct ResolvedRange {
     pub finalized_head: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct IngestOptions {
     pub include_transaction_receipts: bool,
     pub progress: bool,
     pub restore_orphaned_conflicts: bool,
+    pub prefetched_logs: Option<PrefetchedLogChunk>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrefetchedLogChunk {
+    pub from: u64,
+    pub to: u64,
+    pub logs: Vec<RpcLog>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenStandardDetection {
+    pub standard: TokenStandard,
+    pub prefetched_logs: PrefetchedLogChunk,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FetchLogsOptions {
+    progress: bool,
+    prefetched_logs: Option<PrefetchedLogChunk>,
 }
 
 pub async fn resolve_finalized_range(
@@ -75,12 +95,13 @@ pub async fn ingest_source_range(
         bail!("chunk-size must be greater than zero");
     }
 
+    let mut prefetched_logs = options.prefetched_logs;
     let mut standard = source
         .token_standard
         .parse::<TokenStandard>()
         .with_context(|| format!("parse token standard {}", source.token_standard))?;
     if standard.is_auto() {
-        standard = detect_token_standard(
+        let detection = detect_token_standard_with_prefetched_logs(
             rpc,
             &source.contract_address,
             from,
@@ -90,6 +111,8 @@ pub async fn ingest_source_range(
         )
         .await
         .context("detect source token standard")?;
+        standard = detection.standard;
+        prefetched_logs = Some(detection.prefetched_logs);
     }
 
     let chain_label = format!("chain {}", source.chain_id);
@@ -103,7 +126,10 @@ pub async fn ingest_source_range(
         from,
         to,
         chunk_size,
-        options.progress,
+        FetchLogsOptions {
+            progress: options.progress,
+            prefetched_logs,
+        },
     )
     .await?;
     attach_block_timestamps(rpc, &mut logs, options.progress).await?;
@@ -154,7 +180,16 @@ pub async fn fetch_logs_in_chunks(
     to: u64,
     chunk_size: u64,
 ) -> Result<Vec<RpcLog>> {
-    fetch_logs_in_chunks_with_progress(rpc, contract, standard, from, to, chunk_size, false).await
+    fetch_logs_in_chunks_with_progress(
+        rpc,
+        contract,
+        standard,
+        from,
+        to,
+        chunk_size,
+        FetchLogsOptions::default(),
+    )
+    .await
 }
 
 pub async fn validate_contract_code_at_boundaries(
@@ -201,6 +236,21 @@ pub async fn detect_token_standard(
     chunk_size: u64,
     progress: bool,
 ) -> Result<TokenStandard> {
+    Ok(
+        detect_token_standard_with_prefetched_logs(rpc, contract, from, to, chunk_size, progress)
+            .await?
+            .standard,
+    )
+}
+
+pub async fn detect_token_standard_with_prefetched_logs(
+    rpc: &EvmRpcClient,
+    contract: &str,
+    from: u64,
+    to: u64,
+    chunk_size: u64,
+    progress: bool,
+) -> Result<TokenStandardDetection> {
     if from > to {
         bail!("from-block {from} cannot be greater than to-block {to}");
     }
@@ -224,7 +274,14 @@ pub async fn detect_token_standard(
                 )
             })?;
         if let Some(standard) = detect_token_standard_from_logs(&logs)? {
-            return Ok(standard);
+            return Ok(TokenStandardDetection {
+                standard,
+                prefetched_logs: PrefetchedLogChunk {
+                    from: chunk_from,
+                    to: chunk_to,
+                    logs,
+                },
+            });
         }
         if progress && should_report_progress(chunk_number, total_chunks) {
             println!(
@@ -274,7 +331,7 @@ async fn fetch_logs_in_chunks_with_progress(
     from: u64,
     to: u64,
     chunk_size: u64,
-    progress: bool,
+    options: FetchLogsOptions,
 ) -> Result<Vec<RpcLog>> {
     if from > to {
         bail!("from-block {from} cannot be greater than to-block {to}");
@@ -287,16 +344,26 @@ async fn fetch_logs_in_chunks_with_progress(
     let mut chunk_from = from;
     let total_chunks = (((to - from) / chunk_size) + 1) as usize;
     let mut chunk_number = 0usize;
+    let mut prefetched_logs = options.prefetched_logs;
 
     while chunk_from <= to {
         let chunk_to = chunk_from.saturating_add(chunk_size - 1).min(to);
         chunk_number += 1;
-        let chunk_logs = rpc
-            .logs(contract, standard, chunk_from, chunk_to)
-            .await
-            .with_context(|| format!("fetch contract logs {chunk_from}..={chunk_to}"))?;
+        let chunk_logs = if prefetched_logs
+            .as_ref()
+            .is_some_and(|chunk| chunk.from == chunk_from && chunk.to == chunk_to)
+        {
+            prefetched_logs
+                .take()
+                .expect("prefetched chunk exists after matching")
+                .logs
+        } else {
+            rpc.logs(contract, standard, chunk_from, chunk_to)
+                .await
+                .with_context(|| format!("fetch contract logs {chunk_from}..={chunk_to}"))?
+        };
         logs.extend(chunk_logs);
-        if progress && should_report_progress(chunk_number, total_chunks) {
+        if options.progress && should_report_progress(chunk_number, total_chunks) {
             println!(
                 "Fetched log chunk {chunk_number}/{total_chunks} for blocks {chunk_from}..={chunk_to}; logs so far: {}.",
                 logs.len()

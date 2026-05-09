@@ -203,6 +203,7 @@ Use `--standard auto` when you do not want to choose the token standard
 manually. The CLI probes the selected range in small log chunks until it finds
 standard transfer logs, resolves ERC-20, ERC-721, or ERC-1155 from the first
 unambiguous evidence, and persists the concrete detected standard on the source.
+Inline scans reuse the successful probe chunk instead of fetching it again.
 If the range has no standard transfer logs, the log shape is ambiguous, or the
 contract emits multiple token-standard shapes, the command fails with a clear
 error instead of guessing. Pass an explicit `--standard` for hybrid contracts.

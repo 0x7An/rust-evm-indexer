@@ -8,7 +8,8 @@ use indexer_rs::{
     application::{
         backfill::{BackfillPlan, plan_backfill_jobs},
         ingest::{
-            IngestOptions, detect_token_standard, ingest_source_range, normalize_address,
+            IngestOptions, PrefetchedLogChunk, detect_token_standard,
+            detect_token_standard_with_prefetched_logs, ingest_source_range, normalize_address,
             redact_rpc_url, resolve_finalized_range, validate_contract_code_at_boundaries,
         },
         reorg::verify_source_reorgs,
@@ -688,6 +689,29 @@ async fn resolve_requested_standard(
     Ok(detected)
 }
 
+async fn resolve_requested_standard_for_scan(
+    rpc: &EvmRpcClient,
+    contract: &str,
+    requested: TokenStandard,
+    from: u64,
+    to: u64,
+    chunk_size: u64,
+) -> Result<(TokenStandard, Option<PrefetchedLogChunk>)> {
+    if !requested.is_auto() {
+        return Ok((requested, None));
+    }
+
+    let detection =
+        detect_token_standard_with_prefetched_logs(rpc, contract, from, to, chunk_size, true)
+            .await
+            .context("auto-detect token standard")?;
+    println!(
+        "Detected token standard for {contract} over blocks {from}..={to}: {}",
+        detection.standard.as_str()
+    );
+    Ok((detection.standard, Some(detection.prefetched_logs)))
+}
+
 async fn scan_contract(args: ScanContractArgs) -> Result<()> {
     let ScanContractArgs {
         rpc_url,
@@ -724,7 +748,7 @@ async fn scan_contract(args: ScanContractArgs) -> Result<()> {
     let chain_label = format!("{chain_name} ({chain_id})");
     validate_contract_code_at_boundaries(&rpc, &contract, &chain_label, range.from, range.to)
         .await?;
-    let standard = resolve_requested_standard(
+    let (standard, prefetched_logs) = resolve_requested_standard_for_scan(
         &rpc,
         &contract,
         requested_standard,
@@ -774,6 +798,7 @@ async fn scan_contract(args: ScanContractArgs) -> Result<()> {
             include_transaction_receipts,
             progress: true,
             restore_orphaned_conflicts: false,
+            prefetched_logs,
         },
     )
     .await?;

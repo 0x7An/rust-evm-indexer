@@ -268,6 +268,7 @@ impl IngestWorker {
                     include_transaction_receipts: self.include_transaction_receipts,
                     progress: self.progress,
                     restore_orphaned_conflicts: true,
+                    prefetched_logs: None,
                 },
             )
             .await;
@@ -284,6 +285,7 @@ impl IngestWorker {
                 include_transaction_receipts: self.include_transaction_receipts,
                 progress: self.progress,
                 restore_orphaned_conflicts: false,
+                prefetched_logs: None,
             },
         )
         .await?;
