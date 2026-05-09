@@ -153,6 +153,7 @@ CREATE TABLE reorg_events (
     actual_block_hash TEXT,
     detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     replay_job_id UUID REFERENCES jobs(id),
+    mismatches JSONB NOT NULL DEFAULT '[]'::jsonb,
     CHECK (from_block >= 0),
     CHECK (to_block >= 0),
     CHECK (from_block <= to_block)

@@ -137,6 +137,23 @@ async fn records_mismatched_indexed_and_checkpoint_hashes() {
         rows[0].actual_block_hash.as_deref(),
         Some(block_hash("aa").as_str())
     );
+    assert_eq!(
+        rows[0]
+            .mismatches
+            .as_array()
+            .expect("mismatches array")
+            .len(),
+        2
+    );
+    assert_eq!(rows[0].mismatches[0]["block_number"], json!(100));
+    assert_eq!(
+        rows[0].mismatches[1]["expected_block_hash"],
+        json!(block_hash("22"))
+    );
+    assert_eq!(
+        rows[0].mismatches[1]["actual_block_hash"],
+        json!(block_hash("bb"))
+    );
     assert!(rows[0].replay_job_id.is_none());
 }
 

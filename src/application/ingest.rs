@@ -79,6 +79,7 @@ pub async fn resolve_finalized_range(
     })
 }
 
+/// Ingest a finalized source range after the caller has validated the contract code boundary.
 pub async fn ingest_source_range(
     rpc: &EvmRpcClient,
     ledger: &LedgerRepository,
@@ -114,10 +115,6 @@ pub async fn ingest_source_range(
         standard = detection.standard;
         prefetched_logs = Some(detection.prefetched_logs);
     }
-
-    let chain_label = format!("chain {}", source.chain_id);
-    validate_contract_code_at_boundaries(rpc, &source.contract_address, &chain_label, from, to)
-        .await?;
 
     let mut logs = fetch_logs_in_chunks_with_progress(
         rpc,

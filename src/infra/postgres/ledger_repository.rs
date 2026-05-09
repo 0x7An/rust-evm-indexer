@@ -13,7 +13,7 @@ use diesel::{
     upsert::excluded,
 };
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
@@ -134,6 +134,7 @@ pub struct ReorgEventInsert {
     pub expected_block_hash: Option<String>,
     pub actual_block_hash: Option<String>,
     pub replay_job_id: Option<Uuid>,
+    pub mismatches: Value,
 }
 
 #[derive(Debug, QueryableByName)]
@@ -466,6 +467,7 @@ impl LedgerRepository {
                     .actual_block_hash
                     .map(|value| value.to_ascii_lowercase()),
                 replay_job_id: event.replay_job_id,
+                mismatches: event.mismatches,
             })
             .get_result(&mut conn)
             .context("insert reorg event")
@@ -970,51 +972,34 @@ impl LedgerRepository {
             orphaned: false,
         };
 
-        let row = if options.restore_orphaned_conflicts {
-            diesel::insert_into(events::table)
-                .values(values)
-                .on_conflict((
-                    events::chain_id,
-                    events::transaction_hash,
-                    events::log_index,
-                ))
-                .do_update()
-                .set((
-                    events::block_timestamp.eq(excluded(events::block_timestamp)),
-                    events::block_hash.eq(excluded(events::block_hash)),
-                    events::transaction_index.eq(excluded(events::transaction_index)),
-                    events::contract_address.eq(excluded(events::contract_address)),
-                    events::event_name.eq(excluded(events::event_name)),
-                    events::topics.eq(excluded(events::topics)),
-                    events::data.eq(excluded(events::data)),
-                    events::args.eq(excluded(events::args)),
-                    events::finalized.eq(true),
-                    events::orphaned.eq(false),
-                ))
-                .get_result::<super::models::EventRow>(conn)
-        } else {
-            diesel::insert_into(events::table)
-                .values(values)
-                .on_conflict((
-                    events::chain_id,
-                    events::transaction_hash,
-                    events::log_index,
-                ))
-                .do_update()
-                .set((
-                    events::block_timestamp.eq(excluded(events::block_timestamp)),
-                    events::block_hash.eq(excluded(events::block_hash)),
-                    events::transaction_index.eq(excluded(events::transaction_index)),
-                    events::contract_address.eq(excluded(events::contract_address)),
-                    events::event_name.eq(excluded(events::event_name)),
-                    events::topics.eq(excluded(events::topics)),
-                    events::data.eq(excluded(events::data)),
-                    events::args.eq(excluded(events::args)),
-                    events::finalized.eq(true),
-                ))
-                .get_result::<super::models::EventRow>(conn)
+        let row = diesel::insert_into(events::table)
+            .values(values)
+            .on_conflict((
+                events::chain_id,
+                events::transaction_hash,
+                events::log_index,
+            ))
+            .do_update()
+            .set((
+                events::block_timestamp.eq(excluded(events::block_timestamp)),
+                events::block_hash.eq(excluded(events::block_hash)),
+                events::transaction_index.eq(excluded(events::transaction_index)),
+                events::contract_address.eq(excluded(events::contract_address)),
+                events::event_name.eq(excluded(events::event_name)),
+                events::topics.eq(excluded(events::topics)),
+                events::data.eq(excluded(events::data)),
+                events::args.eq(excluded(events::args)),
+                events::finalized.eq(true),
+            ))
+            .get_result::<super::models::EventRow>(conn)
+            .context("upsert event")?;
+
+        if options.restore_orphaned_conflicts && row.orphaned {
+            diesel::update(events::table.filter(events::id.eq(row.id)))
+                .set(events::orphaned.eq(false))
+                .execute(conn)
+                .context("restore replayed event")?;
         }
-        .context("upsert event")?;
 
         Ok(row.id)
     }
@@ -1078,45 +1063,30 @@ impl LedgerRepository {
             orphaned: false,
         };
 
-        let row = if options.restore_orphaned_conflicts {
-            diesel::insert_into(ledger_entries::table)
-                .values(values)
-                .on_conflict((
-                    ledger_entries::chain_id,
-                    ledger_entries::transaction_hash,
-                    ledger_entries::log_index,
-                    ledger_entries::batch_index,
-                ))
-                .do_update()
-                .set((
-                    ledger_entries::amount.eq(excluded(ledger_entries::amount)),
-                    ledger_entries::block_timestamp.eq(excluded(ledger_entries::block_timestamp)),
-                    ledger_entries::block_hash.eq(excluded(ledger_entries::block_hash)),
-                    ledger_entries::transaction_index
-                        .eq(excluded(ledger_entries::transaction_index)),
-                    ledger_entries::orphaned.eq(false),
-                ))
+        let mut row = diesel::insert_into(ledger_entries::table)
+            .values(values)
+            .on_conflict((
+                ledger_entries::chain_id,
+                ledger_entries::transaction_hash,
+                ledger_entries::log_index,
+                ledger_entries::batch_index,
+            ))
+            .do_update()
+            .set((
+                ledger_entries::amount.eq(excluded(ledger_entries::amount)),
+                ledger_entries::block_timestamp.eq(excluded(ledger_entries::block_timestamp)),
+                ledger_entries::block_hash.eq(excluded(ledger_entries::block_hash)),
+                ledger_entries::transaction_index.eq(excluded(ledger_entries::transaction_index)),
+            ))
+            .get_result::<LedgerEntryRow>(conn)
+            .context("upsert ledger entry")?;
+
+        if options.restore_orphaned_conflicts && row.orphaned {
+            row = diesel::update(ledger_entries::table.filter(ledger_entries::id.eq(row.id)))
+                .set(ledger_entries::orphaned.eq(false))
                 .get_result::<LedgerEntryRow>(conn)
-        } else {
-            diesel::insert_into(ledger_entries::table)
-                .values(values)
-                .on_conflict((
-                    ledger_entries::chain_id,
-                    ledger_entries::transaction_hash,
-                    ledger_entries::log_index,
-                    ledger_entries::batch_index,
-                ))
-                .do_update()
-                .set((
-                    ledger_entries::amount.eq(excluded(ledger_entries::amount)),
-                    ledger_entries::block_timestamp.eq(excluded(ledger_entries::block_timestamp)),
-                    ledger_entries::block_hash.eq(excluded(ledger_entries::block_hash)),
-                    ledger_entries::transaction_index
-                        .eq(excluded(ledger_entries::transaction_index)),
-                ))
-                .get_result::<LedgerEntryRow>(conn)
+                .context("restore replayed ledger entry")?;
         }
-        .context("upsert ledger entry")?;
 
         Ok(row)
     }
@@ -1222,9 +1192,11 @@ impl LedgerRepository {
         conn: &mut PgConnection,
         source: &SourceRow,
     ) -> Result<()> {
-        diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
-            .bind::<SqlBigInt, _>(source_advisory_lock_key(source.id))
-            .execute(conn)
+        sources::table
+            .filter(sources::id.eq(source.id))
+            .select(sources::id)
+            .for_update()
+            .first::<Uuid>(conn)
             .context("lock source ledger write")
             .map(|_| ())
     }
@@ -1678,10 +1650,6 @@ fn movement_type(from: &str, to: &str) -> &'static str {
     }
 }
 
-fn source_advisory_lock_key(source_id: Uuid) -> i64 {
-    (source_id.as_u128() >> 64) as u64 as i64
-}
-
 fn parse_optional_hex_i32(value: Option<&str>) -> Result<Option<i32>> {
     value.map(parse_hex_i32).transpose()
 }
@@ -1699,7 +1667,7 @@ fn parse_hex_big_decimal(value: &str) -> Result<BigDecimal> {
     let digits = value
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))
-        .unwrap_or(value);
+        .with_context(|| format!("hex value must start with 0x: {value}"))?;
     if digits.is_empty() {
         anyhow::bail!("hex value {value} is empty");
     }
@@ -1716,4 +1684,15 @@ fn normalized_topics(log: &RpcLog) -> serde_json::Value {
             .map(|topic| topic.to_ascii_lowercase())
             .collect::<Vec<_>>()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_big_decimal_requires_hex_prefix() {
+        let err = parse_hex_big_decimal("5208").unwrap_err();
+        assert!(err.to_string().contains("must start with 0x"));
+    }
 }

@@ -113,6 +113,7 @@ pub fn decode_log(log: &RpcLog, standard: TokenStandard) -> Result<Option<Decode
     let transfer_batch = event_topic("TransferBatch(address,address,address,uint256[],uint256[])");
 
     if topic0 == transfer && matches!(standard, TokenStandard::Erc20 | TokenStandard::Erc721) {
+        validate_transfer_shape_matches_standard(log, standard)?;
         return decode_transfer(log, standard).map(Some);
     }
 
@@ -125,6 +126,23 @@ pub fn decode_log(log: &RpcLog, standard: TokenStandard) -> Result<Option<Decode
     }
 
     Ok(None)
+}
+
+fn validate_transfer_shape_matches_standard(log: &RpcLog, standard: TokenStandard) -> Result<()> {
+    let Some(other_standard) = detect_token_standard_from_log(log)? else {
+        return Ok(());
+    };
+    if other_standard != standard {
+        bail!(
+            "Transfer log {} has {} shape while decoding as {}; hybrid contracts that emit \
+             multiple Transfer shapes are not supported as a single source in V1",
+            log.transaction_hash,
+            other_standard.as_str(),
+            standard.as_str()
+        );
+    }
+
+    Ok(())
 }
 
 pub fn detect_token_standard_from_log(log: &RpcLog) -> Result<Option<TokenStandard>> {
@@ -413,5 +431,28 @@ mod tests {
         assert_eq!(decoded.entries.len(), 1);
         assert_eq!(decoded.entries[0].token_id, "42");
         assert_eq!(decoded.entries[0].amount, "1");
+    }
+
+    #[test]
+    fn errors_when_transfer_shape_matches_another_standard() {
+        let log = RpcLog {
+            address: "0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d".to_string(),
+            topics: vec![
+                event_topic("Transfer(address,address,uint256)"),
+                topic_address_word("11"),
+                topic_address_word("22"),
+                format!("0x{:064x}", 42),
+            ],
+            data: "0x".to_string(),
+            block_number: "0x1".to_string(),
+            transaction_hash: format!("0x{}", "33".repeat(32)),
+            transaction_index: Some("0x0".to_string()),
+            log_index: "0x0".to_string(),
+            block_hash: format!("0x{}", "44".repeat(32)),
+            block_timestamp: None,
+        };
+
+        let err = decode_log(&log, TokenStandard::Erc20).unwrap_err();
+        assert!(err.to_string().contains("erc721 shape"));
     }
 }

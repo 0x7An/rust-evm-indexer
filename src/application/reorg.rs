@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::infra::{
@@ -91,27 +92,28 @@ fn record_reorg_ranges(
         return Ok(());
     };
 
-    let mut range_start = first;
+    let mut range_start = 0usize;
     let mut previous = first;
-    for mismatch in &mismatches[1..] {
+    for (index, mismatch) in mismatches.iter().enumerate().skip(1) {
         if mismatch.block_number == previous.block_number + 1 {
             previous = mismatch;
             continue;
         }
 
-        record_reorg_range(ledger, source, range_start, previous)?;
-        range_start = mismatch;
+        record_reorg_range(ledger, source, &mismatches[range_start..index])?;
+        range_start = index;
         previous = mismatch;
     }
-    record_reorg_range(ledger, source, range_start, previous)
+    record_reorg_range(ledger, source, &mismatches[range_start..])
 }
 
 fn record_reorg_range(
     ledger: &LedgerRepository,
     source: &SourceRow,
-    first: &ReorgMismatch,
-    last: &ReorgMismatch,
+    range: &[ReorgMismatch],
 ) -> Result<()> {
+    let first = range.first().context("reorg range cannot be empty")?;
+    let last = range.last().context("reorg range cannot be empty")?;
     ledger
         .record_reorg_event(ReorgEventInsert {
             source_id: source.id,
@@ -121,6 +123,18 @@ fn record_reorg_range(
             expected_block_hash: Some(first.expected_block_hash.clone()),
             actual_block_hash: Some(first.actual_block_hash.clone()),
             replay_job_id: None,
+            mismatches: json!(
+                range
+                    .iter()
+                    .map(|mismatch| {
+                        json!({
+                            "block_number": mismatch.block_number,
+                            "expected_block_hash": mismatch.expected_block_hash,
+                            "actual_block_hash": mismatch.actual_block_hash,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            ),
         })
         .context("record reorg event")
         .map(|_| ())

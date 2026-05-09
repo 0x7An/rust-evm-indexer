@@ -206,7 +206,8 @@ unambiguous evidence, and persists the concrete detected standard on the source.
 Inline scans reuse the successful probe chunk instead of fetching it again.
 If the range has no standard transfer logs, the log shape is ambiguous, or the
 contract emits multiple token-standard shapes, the command fails with a clear
-error instead of guessing. Pass an explicit `--standard` for hybrid contracts.
+error instead of guessing. Hybrid contracts that emit multiple token-standard
+`Transfer` shapes are not supported as a single source in V1.
 
 ## Durable Ingestion
 
@@ -290,12 +291,15 @@ Backfill jobs use `backfill:` idempotency keys based on `source_id`,
 `from_block`, and `to_block`, so rerunning the same command reports existing
 jobs instead of duplicating work. The queue also enforces uniqueness for a
 source, job type, and block range, which prevents overlap with manually enqueued
-ingest jobs for the same range. These jobs are still `INGEST_RANGE` jobs because
-the command is used for initial/full-history ingestion. `BACKFILL_RANGE` is not
-an active job type; replay and repair work uses `REPLAY_RANGE` so the worker can
-apply audit-preserving orphan semantics. After a worker successfully ingests a
-range, it advances the checkpoint only across contiguous completed ranges, so
-progress does not skip gaps when jobs finish out of order.
+ingest jobs for the same range. This is deliberate: the idempotency key namespace
+records whether the row was planned by `enqueue-contract` or `backfill-contract`,
+while the uniqueness constraint enforces one active `INGEST_RANGE` per
+source/range. These jobs are still `INGEST_RANGE` jobs because the command is
+used for initial/full-history ingestion. `BACKFILL_RANGE` is not an active job
+type; replay and repair work uses `REPLAY_RANGE` so the worker can apply
+audit-preserving orphan semantics. After a worker successfully ingests a range,
+it advances the checkpoint only across contiguous completed ranges, so progress
+does not skip gaps when jobs finish out of order.
 
 Newly ingested events persist both ingestion time and on-chain event metadata:
 `block_timestamp`, `transaction_index`, raw `topics`, and raw `data`. If rows were
@@ -325,9 +329,10 @@ cargo run -- verify-reorg \
 
 The verifier checks stored event block hashes and the source checkpoint hash
 when it falls inside the requested range. Mismatches are persisted to
-`reorg_events` as contiguous affected ranges; matching ranges leave that table
-unchanged. `verify-reorg` does not enqueue replay automatically. That manual
-gate keeps corrective replay explicit after the operator reviews the mismatch.
+`reorg_events` as contiguous affected ranges with a JSON `mismatches` array that
+keeps each block's expected and actual hash; matching ranges leave that table
+unchanged. `verify-reorg` does not enqueue replay automatically. That manual gate
+keeps corrective replay explicit after the operator reviews the mismatch.
 
 After confirming a mismatch, enqueue a replay job for the affected range:
 

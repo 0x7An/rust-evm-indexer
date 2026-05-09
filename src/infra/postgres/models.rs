@@ -315,6 +315,7 @@ pub struct ReorgEventRow {
     pub actual_block_hash: Option<String>,
     pub detected_at: DateTime<Utc>,
     pub replay_job_id: Option<Uuid>,
+    pub mismatches: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -328,4 +329,5 @@ pub struct NewReorgEventRow {
     pub expected_block_hash: Option<String>,
     pub actual_block_hash: Option<String>,
     pub replay_job_id: Option<Uuid>,
+    pub mismatches: serde_json::Value,
 }

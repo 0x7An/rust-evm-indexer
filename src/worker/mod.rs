@@ -1,13 +1,21 @@
 //! Thin job worker adapter for durable ingestion jobs.
 
-use std::future::Future;
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::Duration;
 use uuid::Uuid;
 
 use crate::{
-    application::ingest::{IngestOptions, ingest_source_range},
+    application::ingest::{
+        IngestOptions, ingest_source_range, validate_contract_code_at_boundaries,
+    },
     domain::job::{JobStatus, JobType},
     infra::{
         evm::rpc::EvmRpcClient,
@@ -27,6 +35,7 @@ pub struct IngestWorker {
     chain_id: Option<i64>,
     include_transaction_receipts: bool,
     progress: bool,
+    replay_first: Arc<AtomicBool>,
 }
 
 impl IngestWorker {
@@ -46,6 +55,7 @@ impl IngestWorker {
             chain_id: None,
             include_transaction_receipts: false,
             progress: false,
+            replay_first: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -65,25 +75,24 @@ impl IngestWorker {
     }
 
     pub async fn run_once(&self) -> Result<WorkerOutcome> {
-        let Some(running) = self.lease_and_mark_running()? else {
-            return Ok(WorkerOutcome::NoJob);
-        };
-
-        let result = self.execute_job(&running).await;
-        self.finish_running_job(&running, result)
+        self.run_once_with_current_priority().await
     }
 
     pub async fn run_once_until_shutdown(
         &self,
         shutdown: impl Future<Output = ()>,
     ) -> Result<WorkerOutcome> {
-        let Some(running) = self.lease_and_mark_running()? else {
+        let Some(running) = self.lease_and_mark_running(self.replay_first())? else {
             return Ok(WorkerOutcome::NoJob);
         };
 
         tokio::pin!(shutdown);
         tokio::select! {
-            result = self.execute_job(&running) => self.finish_running_job(&running, result),
+            result = self.execute_job(&running) => {
+                let outcome = self.finish_running_job(&running, result)?;
+                self.update_priority_after_outcome(&running, &outcome);
+                Ok(outcome)
+            }
             _ = &mut shutdown => {
                 let interrupted = self
                     .repositories
@@ -101,20 +110,53 @@ impl IngestWorker {
         }
     }
 
-    fn lease_and_mark_running(&self) -> Result<Option<JobRow>> {
+    async fn run_once_with_current_priority(&self) -> Result<WorkerOutcome> {
+        let Some(running) = self.lease_and_mark_running(self.replay_first())? else {
+            return Ok(WorkerOutcome::NoJob);
+        };
+
+        let result = self.execute_job(&running).await;
+        let outcome = self.finish_running_job(&running, result)?;
+        self.update_priority_after_outcome(&running, &outcome);
+        Ok(outcome)
+    }
+
+    fn replay_first(&self) -> bool {
+        self.replay_first.load(Ordering::Relaxed)
+    }
+
+    fn update_priority_after_outcome(&self, running: &JobRow, outcome: &WorkerOutcome) {
+        match outcome {
+            WorkerOutcome::Processed { .. } => self.replay_first.store(true, Ordering::Relaxed),
+            // Only failed replays demote priority; failed ingestion does not make replay healthier.
+            WorkerOutcome::Failed { .. }
+                if running.job_type == JobType::ReplayRange.to_string() =>
+            {
+                self.replay_first.store(false, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    fn lease_and_mark_running(&self, replay_first: bool) -> Result<Option<JobRow>> {
         if self.chunk_size == 0 {
             bail!("chunk-size must be greater than zero");
         }
 
-        let leased = match self
-            .lease_next_supported_type(JobType::ReplayRange)
-            .context("lease next replay job")?
-        {
-            Some(job) => Some(job),
-            None => self
-                .lease_next_supported_type(JobType::IngestRange)
-                .context("lease next ingest job")?,
+        let job_types = if replay_first {
+            [JobType::ReplayRange, JobType::IngestRange]
+        } else {
+            [JobType::IngestRange, JobType::ReplayRange]
         };
+        let mut leased = None;
+        for job_type in job_types {
+            leased = self
+                .lease_next_supported_type(job_type)
+                .with_context(|| format!("lease next {job_type} job"))?;
+            if leased.is_some() {
+                break;
+            }
+        }
 
         let Some(leased) = leased else {
             return Ok(None);
@@ -243,6 +285,15 @@ impl IngestWorker {
                 "job target block {to} is newer than observed finalized block {observed_finalized_block}"
             );
         }
+        let chain_label = format!("chain {}", source.chain_id);
+        validate_contract_code_at_boundaries(
+            &self.rpc,
+            &source.contract_address,
+            &chain_label,
+            from as u64,
+            to as u64,
+        )
+        .await?;
 
         if job_type == JobType::ReplayRange {
             let orphaned = self

@@ -470,6 +470,102 @@ async fn worker_prioritizes_replay_jobs_over_ingest_jobs() {
 }
 
 #[tokio::test]
+async fn worker_does_not_let_failing_replay_starve_ingest_forever() {
+    let ctx = setup();
+    let rpc_url = start_fake_rpc_with_missing_code(ctx.contract.clone(), 100).await;
+    ctx.repositories
+        .ledger()
+        .ensure_chain(
+            &format!("worker-replay-fairness-test-chain-{}", ctx.chain_id),
+            ctx.chain_id,
+            "<test>",
+            12,
+        )
+        .expect("ensure chain");
+    let source = ctx
+        .repositories
+        .ledger()
+        .ensure_source(
+            ctx.chain_id,
+            "worker-replay-fairness-test-source",
+            &ctx.contract,
+            TokenStandard::Erc721,
+            100,
+        )
+        .expect("ensure source");
+    let replay_job_id = enqueued_job_id(
+        ctx.repositories
+            .jobs()
+            .enqueue(
+                NewJob::new(
+                    JobType::ReplayRange,
+                    ctx.chain_id,
+                    format!("it:worker-replay-fairness-replay:{}:100:100", source.id),
+                )
+                .with_source(source.id)
+                .with_range(100, 100),
+            )
+            .expect("enqueue replay job"),
+    );
+    let ingest_job_id = enqueued_job_id(
+        ctx.repositories
+            .jobs()
+            .enqueue(
+                NewJob::new(
+                    JobType::IngestRange,
+                    ctx.chain_id,
+                    format!("it:worker-replay-fairness-ingest:{}:101:101", source.id),
+                )
+                .with_source(source.id)
+                .with_range(101, 101),
+            )
+            .expect("enqueue ingest job"),
+    );
+
+    let worker = IngestWorker::new(
+        ctx.repositories.clone(),
+        EvmRpcClient::new(rpc_url),
+        "worker-replay-fairness-it",
+        Duration::seconds(60),
+        10,
+    )
+    .with_chain_id(ctx.chain_id);
+    let first = worker
+        .run_once_until_shutdown(std::future::pending())
+        .await
+        .expect("run worker once");
+    let WorkerOutcome::Failed { .. } = first else {
+        panic!("first production worker pass should fail replay, got {first:?}");
+    };
+
+    let second = worker
+        .run_once_until_shutdown(std::future::pending())
+        .await
+        .expect("run worker again");
+    let WorkerOutcome::Processed { job_id, .. } = second else {
+        panic!("second production worker pass should process ingest, got {second:?}");
+    };
+    assert_eq!(job_id, ingest_job_id);
+
+    let jobs = ctx
+        .repositories
+        .jobs()
+        .jobs_for_source(source.id)
+        .expect("load jobs");
+    let replay = jobs
+        .iter()
+        .find(|job| job.id == replay_job_id)
+        .expect("replay job exists");
+    let ingest = jobs
+        .iter()
+        .find(|job| job.id == ingest_job_id)
+        .expect("ingest job exists");
+    assert_eq!(replay.status, JobStatus::Queued.as_str());
+    assert_eq!(replay.attempts, 1);
+    assert_eq!(ingest.status, JobStatus::Succeeded.as_str());
+}
+
+#[tokio::test]
 async fn worker_replays_range_by_orphaning_existing_rows_and_ingesting_canonical_logs() {
     let ctx = setup();
     let rpc_url = start_fake_rpc(ctx.contract.clone()).await;

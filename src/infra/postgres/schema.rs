@@ -116,6 +116,7 @@ diesel::table! {
         actual_block_hash -> Nullable<Text>,
         detected_at -> Timestamptz,
         replay_job_id -> Nullable<Uuid>,
+        mismatches -> Jsonb,
     }
 }
 
