@@ -106,20 +106,15 @@ impl IngestWorker {
             bail!("chunk-size must be greater than zero");
         }
 
-        let leased = match self.chain_id {
-            Some(chain_id) => self.repositories.jobs().lease_next_for_type_and_chain(
-                &self.worker_id,
-                self.lease_for,
-                JobType::IngestRange,
-                chain_id,
-            ),
-            None => self.repositories.jobs().lease_next_for_type(
-                &self.worker_id,
-                self.lease_for,
-                JobType::IngestRange,
-            ),
-        }
-        .context("lease next job")?;
+        let leased = match self
+            .lease_next_supported_type(JobType::IngestRange)
+            .context("lease next ingest job")?
+        {
+            Some(job) => Some(job),
+            None => self
+                .lease_next_supported_type(JobType::ReplayRange)
+                .context("lease next replay job")?,
+        };
 
         let Some(leased) = leased else {
             return Ok(None);
@@ -132,6 +127,23 @@ impl IngestWorker {
             .context("mark job running")?;
 
         Ok(Some(running))
+    }
+
+    fn lease_next_supported_type(&self, job_type: JobType) -> Result<Option<JobRow>> {
+        match self.chain_id {
+            Some(chain_id) => self.repositories.jobs().lease_next_for_type_and_chain(
+                &self.worker_id,
+                self.lease_for,
+                job_type,
+                chain_id,
+            ),
+            None => self.repositories.jobs().lease_next_for_type(
+                &self.worker_id,
+                self.lease_for,
+                job_type,
+            ),
+        }
+        .context("lease next supported job")
     }
 
     fn finish_running_job(
@@ -201,23 +213,23 @@ impl IngestWorker {
             .job_type
             .parse::<JobType>()
             .with_context(|| format!("parse job type {}", job.job_type))?;
-        if job_type != JobType::IngestRange {
+        if !matches!(job_type, JobType::IngestRange | JobType::ReplayRange) {
             bail!("unsupported worker job type {}", job.job_type);
         }
 
-        let source_id = job.source_id.context("ingest job is missing source_id")?;
-        let from = job.from_block.context("ingest job is missing from_block")?;
-        let to = job.to_block.context("ingest job is missing to_block")?;
+        let source_id = job.source_id.context("range job is missing source_id")?;
+        let from = job.from_block.context("range job is missing from_block")?;
+        let to = job.to_block.context("range job is missing to_block")?;
         if from < 0 || to < 0 {
-            bail!("ingest job range cannot be negative");
+            bail!("range job range cannot be negative");
         }
 
         let source = self
             .repositories
             .ledger()
             .source_by_id(source_id)
-            .context("load ingest source")?
-            .context("ingest source not found")?;
+            .context("load job source")?
+            .context("job source not found")?;
         if source.chain_id != job.chain_id {
             bail!(
                 "job chain_id {} does not match source chain_id {}",
@@ -230,6 +242,34 @@ impl IngestWorker {
             bail!(
                 "job target block {to} is newer than observed finalized block {observed_finalized_block}"
             );
+        }
+
+        if job_type == JobType::ReplayRange {
+            let orphaned = self
+                .repositories
+                .ledger()
+                .orphan_source_range(&source, from, to)
+                .context("orphan replay range")?;
+            if self.progress {
+                println!(
+                    "Replay orphaned {} events and {} ledger entries for blocks {from}..={to}.",
+                    orphaned.events_orphaned, orphaned.ledger_entries_orphaned
+                );
+            }
+
+            return ingest_source_range(
+                &self.rpc,
+                self.repositories.ledger(),
+                &source,
+                from as u64,
+                to as u64,
+                self.chunk_size,
+                IngestOptions {
+                    include_transaction_receipts: self.include_transaction_receipts,
+                    progress: self.progress,
+                },
+            )
+            .await;
         }
 
         let summary = ingest_source_range(

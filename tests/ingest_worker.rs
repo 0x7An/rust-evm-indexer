@@ -12,7 +12,7 @@ use indexer_rs::{
     domain::job::{JobStatus, JobType},
     infra::{
         evm::{
-            decoder::{TokenStandard, event_topic},
+            decoder::{DecodedLedgerEntry, DecodedLog, RpcLog, TokenStandard, event_topic},
             rpc::EvmRpcClient,
         },
         postgres::{
@@ -382,6 +382,101 @@ async fn worker_runs_until_queue_is_idle() {
     assert_eq!(checkpoint.processed_block, 101);
 }
 
+#[tokio::test]
+async fn worker_replays_range_by_orphaning_existing_rows_and_ingesting_canonical_logs() {
+    let ctx = setup();
+    let rpc_url = start_fake_rpc(ctx.contract.clone()).await;
+    ctx.repositories
+        .ledger()
+        .ensure_chain(
+            &format!("worker-replay-test-chain-{}", ctx.chain_id),
+            ctx.chain_id,
+            "<test>",
+            12,
+        )
+        .expect("ensure chain");
+    let source = ctx
+        .repositories
+        .ledger()
+        .ensure_source(
+            ctx.chain_id,
+            "worker-replay-test-source",
+            &ctx.contract,
+            TokenStandard::Erc721,
+            100,
+        )
+        .expect("ensure source");
+    ctx.repositories
+        .ledger()
+        .persist_decoded_logs(&source, &[decoded_transfer_log(&ctx.contract, 100)])
+        .expect("persist old decoded log");
+
+    ctx.repositories
+        .jobs()
+        .enqueue(
+            NewJob::new(
+                JobType::ReplayRange,
+                ctx.chain_id,
+                format!("it:worker-replay:{}:100:100", source.id),
+            )
+            .with_source(source.id)
+            .with_range(100, 100),
+        )
+        .expect("enqueue replay job");
+
+    let worker = IngestWorker::new(
+        ctx.repositories.clone(),
+        EvmRpcClient::new(rpc_url),
+        "worker-replay-it",
+        Duration::seconds(60),
+        10,
+    )
+    .with_chain_id(ctx.chain_id);
+    let outcome = worker.run_once().await.expect("run replay worker once");
+
+    let WorkerOutcome::Processed { summary, .. } = outcome else {
+        panic!("worker should process replay job, got {outcome:?}");
+    };
+    assert_eq!(summary.events_seen, 1);
+    assert_eq!(summary.ledger_entries_persisted, 1);
+    assert_eq!(summary.holder_count, 1);
+
+    let mut conn = ctx.pool.get().expect("get postgres connection");
+    let active_events = events::table
+        .filter(events::source_id.eq(source.id))
+        .filter(events::orphaned.eq(false))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .expect("count active events");
+    let orphaned_events = events::table
+        .filter(events::source_id.eq(source.id))
+        .filter(events::orphaned.eq(true))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .expect("count orphaned events");
+    assert_eq!(active_events, 1);
+    assert_eq!(orphaned_events, 1);
+
+    let old_row_orphaned = ledger_entries::table
+        .filter(ledger_entries::source_id.eq(source.id))
+        .filter(ledger_entries::transaction_hash.eq(format!("0x{}", "aa".repeat(32))))
+        .select(ledger_entries::orphaned)
+        .first::<bool>(&mut conn)
+        .expect("load old ledger row");
+    assert!(old_row_orphaned);
+
+    let holders = ctx
+        .repositories
+        .ledger()
+        .holders(ctx.chain_id, &ctx.contract, 10)
+        .expect("load holders")
+        .expect("holders exist");
+    assert_eq!(holders.len(), 1);
+    assert_eq!(holders[0].holder_address, address("11"));
+    assert_eq!(holders[0].token_id, "42");
+    assert_eq!(holders[0].balance, "1");
+}
+
 async fn start_fake_rpc(contract: String) -> String {
     let (url, _) = start_fake_rpc_inner(contract, false).await;
     url
@@ -504,6 +599,35 @@ fn erc721_transfer_log(contract: &str, block_number: u64) -> Value {
         "logIndex": "0x0",
         "blockHash": format!("0x{:064x}", block_number + 1),
     })
+}
+
+fn decoded_transfer_log(contract: &str, block_number: u64) -> (RpcLog, DecodedLog) {
+    (
+        RpcLog {
+            address: contract.to_string(),
+            topics: Vec::new(),
+            data: "0x".to_string(),
+            block_number: format!("0x{block_number:x}"),
+            transaction_hash: format!("0x{}", "aa".repeat(32)),
+            transaction_index: Some("0x0".to_string()),
+            log_index: "0x0".to_string(),
+            block_hash: format!("0x{}", "bb".repeat(32)),
+            block_timestamp: Some(block_timestamp_for(block_number)),
+        },
+        DecodedLog {
+            event_name: "Transfer".to_string(),
+            entries: vec![DecodedLedgerEntry {
+                event_name: "Transfer".to_string(),
+                token_standard: TokenStandard::Erc721,
+                operator: None,
+                from: address("00"),
+                to: address("22"),
+                token_id: "42".to_string(),
+                amount: "1".to_string(),
+                batch_index: 0,
+            }],
+        },
+    )
 }
 
 fn block_timestamp_for(_block_number: u64) -> DateTime<Utc> {

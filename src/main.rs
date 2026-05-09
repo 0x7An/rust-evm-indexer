@@ -184,6 +184,33 @@ enum Commands {
         max_attempts: i32,
     },
 
+    /// Enqueue a durable replay job for an already indexed contract range.
+    EnqueueReplay {
+        /// Postgres database URL. Prefer DATABASE_URL for local use.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+
+        /// EVM chain id for the indexed source.
+        #[arg(long, default_value_t = 1)]
+        chain_id: i64,
+
+        /// Contract address to replay.
+        #[arg(long)]
+        contract: String,
+
+        /// Inclusive replay start block.
+        #[arg(long)]
+        from_block: u64,
+
+        /// Inclusive replay end block.
+        #[arg(long)]
+        to_block: u64,
+
+        /// Maximum attempts before the replay job is dead-lettered.
+        #[arg(long, default_value_t = 5)]
+        max_attempts: i32,
+    },
+
     /// Repair event block timestamps and raw log metadata for already indexed rows.
     BackfillEventMetadata {
         /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
@@ -484,6 +511,21 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        Commands::EnqueueReplay {
+            database_url,
+            chain_id,
+            contract,
+            from_block,
+            to_block,
+            max_attempts,
+        } => enqueue_replay(
+            database_url,
+            chain_id,
+            contract,
+            from_block,
+            to_block,
+            max_attempts,
+        ),
         Commands::BackfillEventMetadata {
             rpc_url,
             database_url,
@@ -927,6 +969,64 @@ async fn backfill_contract(args: BackfillContractArgs) -> Result<()> {
     Ok(())
 }
 
+fn enqueue_replay(
+    database_url: String,
+    chain_id: i64,
+    contract: String,
+    from_block: u64,
+    to_block: u64,
+    max_attempts: i32,
+) -> Result<()> {
+    let contract = normalize_address(&contract)?;
+    if chain_id <= 0 {
+        bail!("chain-id must be greater than zero");
+    }
+    if from_block > to_block {
+        bail!("from-block {from_block} cannot be greater than to-block {to_block}");
+    }
+    if max_attempts <= 0 {
+        bail!("max-attempts must be greater than zero");
+    }
+    let from_i64 =
+        i64::try_from(from_block).context("from-block exceeds postgres bigint storage")?;
+    let to_i64 = i64::try_from(to_block).context("to-block exceeds postgres bigint storage")?;
+
+    let pool = build_pool(&database_url).context("build postgres pool")?;
+    let repositories = PostgresRepositories::new(pool);
+    let source = repositories
+        .ledger()
+        .source_by_contract(chain_id, &contract)
+        .context("load source by contract")?
+        .context("contract source not found")?;
+    let idempotency_key = format!("replay:{}:{}:{}", source.id, from_block, to_block);
+    let result = repositories
+        .jobs()
+        .enqueue(
+            NewJob::new(JobType::ReplayRange, chain_id, idempotency_key)
+                .with_source(source.id)
+                .with_range(from_i64, to_i64)
+                .with_max_attempts(max_attempts),
+        )
+        .context("enqueue replay job")?;
+
+    match result {
+        EnqueueResult::Inserted(job) => {
+            println!(
+                "Enqueued replay job {} for {} blocks {}..={}",
+                job.id, source.contract_address, from_block, to_block
+            );
+        }
+        EnqueueResult::Existing(job) => {
+            println!(
+                "Replay job already exists as {} for {} blocks {}..={}",
+                job.id, source.contract_address, from_block, to_block
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn backfill_event_metadata(
     rpc_url: String,
     database_url: String,
@@ -1280,7 +1380,7 @@ fn print_worker_outcome(outcome: &WorkerOutcome) {
     match outcome {
         WorkerOutcome::NoJob => println!("No queued jobs available."),
         WorkerOutcome::Processed { job_id, summary } => {
-            println!("Processed ingest job {job_id}.");
+            println!("Processed range job {job_id}.");
             print_scan_summary(summary);
         }
         WorkerOutcome::Failed {

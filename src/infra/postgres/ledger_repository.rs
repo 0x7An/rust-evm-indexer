@@ -108,6 +108,12 @@ pub struct LogMetadataUpdate {
     pub ledger_entries_updated: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanRangeSummary {
+    pub events_orphaned: usize,
+    pub ledger_entries_orphaned: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexedBlockHash {
     pub block_number: i64,
@@ -430,6 +436,71 @@ impl LedgerRepository {
             ))
             .load(&mut conn)
             .context("load reorg events for source")
+    }
+
+    pub fn orphan_source_range(
+        &self,
+        source: &SourceRow,
+        from_block: i64,
+        to_block: i64,
+    ) -> Result<OrphanRangeSummary> {
+        if from_block < 0 || to_block < 0 {
+            anyhow::bail!("orphan range cannot be negative");
+        }
+        if from_block > to_block {
+            anyhow::bail!("from-block {from_block} cannot be greater than to-block {to_block}");
+        }
+
+        let mut conn = self.connection()?;
+        conn.transaction::<OrphanRangeSummary, anyhow::Error, _>(|conn| {
+            let rows = ledger_entries::table
+                .filter(ledger_entries::source_id.eq(source.id))
+                .filter(ledger_entries::block_number.ge(from_block))
+                .filter(ledger_entries::block_number.le(to_block))
+                .filter(ledger_entries::orphaned.eq(false))
+                .order((
+                    ledger_entries::block_number.asc(),
+                    ledger_entries::log_index.asc(),
+                    ledger_entries::batch_index.asc(),
+                ))
+                .for_update()
+                .load::<LedgerEntryRow>(conn)
+                .context("lock ledger entries for orphaning")?;
+
+            for row in &rows {
+                let mut orphaned = row.clone();
+                orphaned.orphaned = true;
+                self.apply_balance_delta(conn, source, Some(row), &orphaned)?;
+            }
+
+            let ledger_entries_orphaned = diesel::update(
+                ledger_entries::table
+                    .filter(ledger_entries::source_id.eq(source.id))
+                    .filter(ledger_entries::block_number.ge(from_block))
+                    .filter(ledger_entries::block_number.le(to_block))
+                    .filter(ledger_entries::orphaned.eq(false)),
+            )
+            .set(ledger_entries::orphaned.eq(true))
+            .execute(conn)
+            .context("mark ledger entries orphaned")?;
+
+            let events_orphaned = diesel::update(
+                events::table
+                    .filter(events::source_id.eq(source.id))
+                    .filter(events::block_number.ge(from_block))
+                    .filter(events::block_number.le(to_block))
+                    .filter(events::orphaned.eq(false)),
+            )
+            .set(events::orphaned.eq(true))
+            .execute(conn)
+            .context("mark events orphaned")?;
+
+            Ok(OrphanRangeSummary {
+                events_orphaned,
+                ledger_entries_orphaned,
+            })
+        })
+        .context("orphan source range")
     }
 
     pub fn event_blocks_missing_metadata(&self, source_id: Uuid, limit: i64) -> Result<Vec<i64>> {

@@ -318,6 +318,21 @@ The verifier checks stored event block hashes and the source checkpoint hash
 when it falls inside the requested range. Mismatches are persisted to
 `reorg_events`; matching ranges leave that table unchanged.
 
+After confirming a mismatch, enqueue a replay job for the affected range:
+
+```sh
+cargo run -- enqueue-replay \
+  --chain-id 1 \
+  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
+  --from-block 12287507 \
+  --to-block 12287507
+```
+
+`REPLAY_RANGE` jobs are executed by the same worker. The worker marks existing
+events and ledger entries in the replay range as orphaned, reverses their holder
+balance effects, then fetches canonical logs for that range and persists the new
+current ledger rows. Replay jobs do not advance the normal ingest checkpoint.
+
 Drain a planned full-history backfill until the queue is empty:
 
 ```sh
