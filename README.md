@@ -89,14 +89,15 @@ This repository is intended to grow through small, reviewable checkpoints:
 9. Continuous worker loop and job status CLI
 10. Paginated ledger queries
 11. Event block/log metadata
-12. Repair/replay support
-13. Observability and doctor CLI
+12. Optional transaction receipt ingestion
+13. Repair/replay support
+14. Observability and doctor CLI
 
 Each checkpoint should keep the project buildable, include focused validation, and produce a clear commit/PR boundary.
 
 ## Current Status
 
-Checkpoint 11 is complete. The project currently contains the public Rust skeleton, pure domain model, Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, cursor-paginated read APIs, and event block/log metadata for querying ledger history by real on-chain time. Repair/replay support and observability will be introduced in later checkpoints.
+Checkpoint 12 is complete. The project currently contains the public Rust skeleton, pure domain model, Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, cursor-paginated read APIs, event block/log metadata for querying ledger history by real on-chain time, and optional transaction receipt ingestion for transaction sender/status/gas provenance. Repair/replay support and observability will be introduced in later checkpoints.
 
 ## Development
 
@@ -227,6 +228,24 @@ cargo run -- worker run-once \
 
 `enqueue-contract` resolves the finalized range, verifies contract bytecode, creates or updates the source, and inserts an idempotent `INGEST_RANGE` job. `worker run-once` leases the next available ingest job, optionally restricted by `--chain-id`, marks it running, executes the same decoder/persistence path as `scan-contract`, and marks the job succeeded or failed.
 
+Receipt ingestion is opt-in because it adds one `eth_getTransactionReceipt` RPC
+call per unique transaction hash. Enable it when transaction sender/status/gas
+provenance matters for the indexed slice:
+
+```sh
+cargo run -- worker run-once \
+  --worker-id local-worker \
+  --chain-id 137 \
+  --lease-seconds 300 \
+  --chunk-size 10 \
+  --include-transaction-receipts
+```
+
+The same flag is available on `scan-contract` and `worker run`. Receipts are
+upserted into `transaction_receipts` by `(chain_id, transaction_hash)` and keep
+the raw receipt JSON alongside normalized fields such as `from_address`,
+`to_address`, `status`, `gas_used`, and `effective_gas_price`.
+
 For larger ranges, plan a resumable backfill. This splits the requested finalized range into deterministic `INGEST_RANGE` jobs and skips ranges that are already covered by the source checkpoint:
 
 ```sh
@@ -266,6 +285,7 @@ cargo run -- worker run \
   --chain-id 137 \
   --lease-seconds 300 \
   --chunk-size 100 \
+  --include-transaction-receipts \
   --stop-when-idle
 ```
 

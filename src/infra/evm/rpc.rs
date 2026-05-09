@@ -12,6 +12,23 @@ pub struct BlockMetadata {
     pub timestamp: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RpcTransactionReceipt {
+    pub transaction_hash: String,
+    pub transaction_index: String,
+    pub block_hash: String,
+    pub block_number: String,
+    pub from: String,
+    pub to: Option<String>,
+    pub contract_address: Option<String>,
+    pub status: Option<String>,
+    pub gas_used: String,
+    pub cumulative_gas_used: String,
+    pub effective_gas_price: Option<String>,
+    pub transaction_type: Option<String>,
+    pub raw: Value,
+}
+
 #[derive(Clone)]
 pub struct EvmRpcClient {
     client: Client,
@@ -101,6 +118,36 @@ impl EvmRpcClient {
         serde_json::from_value(value).context("decode eth_getLogs response")
     }
 
+    pub async fn transaction_receipt(
+        &self,
+        transaction_hash: &str,
+    ) -> Result<RpcTransactionReceipt> {
+        let value = self
+            .call("eth_getTransactionReceipt", json!([transaction_hash]))
+            .await?;
+        if value.is_null() {
+            bail!("eth_getTransactionReceipt returned null for {transaction_hash}");
+        }
+
+        let fields = serde_json::from_value::<RpcTransactionReceiptFields>(value.clone())
+            .context("decode eth_getTransactionReceipt response")?;
+        Ok(RpcTransactionReceipt {
+            transaction_hash: fields.transaction_hash,
+            transaction_index: fields.transaction_index,
+            block_hash: fields.block_hash,
+            block_number: fields.block_number,
+            from: fields.from,
+            to: fields.to,
+            contract_address: fields.contract_address,
+            status: fields.status,
+            gas_used: fields.gas_used,
+            cumulative_gas_used: fields.cumulative_gas_used,
+            effective_gas_price: fields.effective_gas_price,
+            transaction_type: fields.transaction_type,
+            raw: value,
+        })
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let response = self
             .client
@@ -173,4 +220,22 @@ struct JsonRpcResponse {
 struct JsonRpcError {
     code: i64,
     message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcTransactionReceiptFields {
+    transaction_hash: String,
+    transaction_index: String,
+    block_hash: String,
+    block_number: String,
+    from: String,
+    to: Option<String>,
+    contract_address: Option<String>,
+    status: Option<String>,
+    gas_used: String,
+    cumulative_gas_used: String,
+    effective_gas_price: Option<String>,
+    #[serde(rename = "type")]
+    transaction_type: Option<String>,
 }

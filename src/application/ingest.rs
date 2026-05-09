@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 
 use crate::infra::{
     evm::{
         decoder::{RpcLog, TokenStandard, decode_log, parse_hex_u64},
-        rpc::EvmRpcClient,
+        rpc::{EvmRpcClient, RpcTransactionReceipt},
     },
     postgres::{
         ledger_repository::{LedgerRepository, ScanSummary},
@@ -18,6 +18,11 @@ pub struct ResolvedRange {
     pub from: u64,
     pub to: u64,
     pub finalized_head: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IngestOptions {
+    pub include_transaction_receipts: bool,
 }
 
 pub async fn resolve_finalized_range(
@@ -57,6 +62,7 @@ pub async fn ingest_source_range(
     from: u64,
     to: u64,
     chunk_size: u64,
+    options: IngestOptions,
 ) -> Result<ScanSummary> {
     if from > to {
         bail!("from-block {from} cannot be greater than to-block {to}");
@@ -94,15 +100,28 @@ pub async fn ingest_source_range(
     attach_block_timestamps(rpc, &mut logs).await?;
 
     let mut decoded = Vec::new();
+    let mut transaction_hashes = BTreeSet::new();
     for log in logs {
         if let Some(decoded_log) = decode_log(&log, standard).context("decode log")? {
+            transaction_hashes.insert(log.transaction_hash.to_ascii_lowercase());
             decoded.push((log, decoded_log));
         }
     }
 
-    ledger
+    let mut summary = ledger
         .persist_decoded_logs(source, &decoded)
-        .context("persist ledger")
+        .context("persist ledger")?;
+
+    if options.include_transaction_receipts {
+        let receipts = fetch_transaction_receipts(rpc, transaction_hashes)
+            .await
+            .context("fetch transaction receipts")?;
+        summary.transaction_receipts_persisted = ledger
+            .persist_transaction_receipts(source.chain_id, &receipts)
+            .context("persist transaction receipts")?;
+    }
+
+    Ok(summary)
 }
 
 pub async fn fetch_logs_in_chunks(
@@ -154,6 +173,22 @@ async fn attach_block_timestamps(rpc: &EvmRpcClient, logs: &mut [RpcLog]) -> Res
     }
 
     Ok(())
+}
+
+async fn fetch_transaction_receipts(
+    rpc: &EvmRpcClient,
+    transaction_hashes: BTreeSet<String>,
+) -> Result<Vec<RpcTransactionReceipt>> {
+    let mut receipts = Vec::with_capacity(transaction_hashes.len());
+    for transaction_hash in transaction_hashes {
+        receipts.push(
+            rpc.transaction_receipt(&transaction_hash)
+                .await
+                .with_context(|| format!("fetch transaction receipt {transaction_hash}"))?,
+        );
+    }
+
+    Ok(receipts)
 }
 
 pub fn parse_block_arg(value: &str, latest: u64) -> Result<u64> {

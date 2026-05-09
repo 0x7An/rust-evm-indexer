@@ -10,16 +10,23 @@ use uuid::Uuid;
 
 use crate::{
     domain::job::JobStatus,
-    infra::evm::decoder::{DecodedLog, RpcLog, TokenStandard, parse_hex_u64},
+    infra::evm::{
+        decoder::{DecodedLog, RpcLog, TokenStandard, parse_hex_u64},
+        rpc::RpcTransactionReceipt,
+    },
 };
 
 use super::{
     connection::PgPool,
     models::{
         ChainRow, CheckpointRow, LedgerEntryRow, NewChainRow, NewCheckpointRow, NewEventRow,
-        NewLedgerEntryRow, NewSourceRow, NewTokenBalanceRow, SourceRow, TokenBalanceRow,
+        NewLedgerEntryRow, NewSourceRow, NewTokenBalanceRow, NewTransactionReceiptRow, SourceRow,
+        TokenBalanceRow, TransactionReceiptRow,
     },
-    schema::{chains, checkpoints, events, jobs, ledger_entries, sources, token_balances},
+    schema::{
+        chains, checkpoints, events, jobs, ledger_entries, sources, token_balances,
+        transaction_receipts,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -28,6 +35,7 @@ pub struct ScanSummary {
     pub events_seen: usize,
     pub events_persisted: usize,
     pub ledger_entries_persisted: usize,
+    pub transaction_receipts_persisted: usize,
     pub holder_count: i64,
     pub minter_count: i64,
     pub top_holders: Vec<TokenBalanceRow>,
@@ -231,12 +239,31 @@ impl LedgerRepository {
                 events_seen: logs.len(),
                 events_persisted,
                 ledger_entries_persisted,
+                transaction_receipts_persisted: 0,
                 holder_count,
                 minter_count,
                 top_holders,
             })
         })
         .context("persist decoded logs")
+    }
+
+    pub fn persist_transaction_receipts(
+        &self,
+        chain_id: i64,
+        receipts: &[RpcTransactionReceipt],
+    ) -> Result<usize> {
+        let mut conn = self.connection()?;
+        conn.transaction::<usize, anyhow::Error, _>(|conn| {
+            let mut persisted = 0;
+            for receipt in receipts {
+                self.upsert_transaction_receipt(conn, chain_id, receipt)?;
+                persisted += 1;
+            }
+
+            Ok(persisted)
+        })
+        .context("persist transaction receipts")
     }
 
     pub fn source_by_contract(
@@ -808,6 +835,69 @@ impl LedgerRepository {
         Ok(row.id)
     }
 
+    fn upsert_transaction_receipt(
+        &self,
+        conn: &mut PgConnection,
+        chain_id: i64,
+        receipt: &RpcTransactionReceipt,
+    ) -> Result<Uuid> {
+        let row = diesel::insert_into(transaction_receipts::table)
+            .values(NewTransactionReceiptRow {
+                id: Uuid::new_v4(),
+                chain_id,
+                transaction_hash: receipt.transaction_hash.to_ascii_lowercase(),
+                block_number: parse_hex_u64(&receipt.block_number)? as i64,
+                block_hash: receipt.block_hash.to_ascii_lowercase(),
+                transaction_index: Some(parse_hex_i32(&receipt.transaction_index)?),
+                from_address: receipt.from.to_ascii_lowercase(),
+                to_address: receipt.to.as_ref().map(|value| value.to_ascii_lowercase()),
+                contract_address: receipt
+                    .contract_address
+                    .as_ref()
+                    .map(|value| value.to_ascii_lowercase()),
+                status: parse_optional_hex_i32(receipt.status.as_deref())?,
+                gas_used: parse_hex_big_decimal(&receipt.gas_used)?,
+                cumulative_gas_used: parse_hex_big_decimal(&receipt.cumulative_gas_used)?,
+                effective_gas_price: parse_optional_hex_big_decimal(
+                    receipt.effective_gas_price.as_deref(),
+                )?,
+                transaction_type: receipt
+                    .transaction_type
+                    .as_ref()
+                    .map(|value| value.to_ascii_lowercase()),
+                raw_receipt: receipt.raw.clone(),
+            })
+            .on_conflict((
+                transaction_receipts::chain_id,
+                transaction_receipts::transaction_hash,
+            ))
+            .do_update()
+            .set((
+                transaction_receipts::block_number.eq(excluded(transaction_receipts::block_number)),
+                transaction_receipts::block_hash.eq(excluded(transaction_receipts::block_hash)),
+                transaction_receipts::transaction_index
+                    .eq(excluded(transaction_receipts::transaction_index)),
+                transaction_receipts::from_address.eq(excluded(transaction_receipts::from_address)),
+                transaction_receipts::to_address.eq(excluded(transaction_receipts::to_address)),
+                transaction_receipts::contract_address
+                    .eq(excluded(transaction_receipts::contract_address)),
+                transaction_receipts::status.eq(excluded(transaction_receipts::status)),
+                transaction_receipts::gas_used.eq(excluded(transaction_receipts::gas_used)),
+                transaction_receipts::cumulative_gas_used
+                    .eq(excluded(transaction_receipts::cumulative_gas_used)),
+                transaction_receipts::effective_gas_price
+                    .eq(excluded(transaction_receipts::effective_gas_price)),
+                transaction_receipts::transaction_type
+                    .eq(excluded(transaction_receipts::transaction_type)),
+                transaction_receipts::raw_receipt.eq(excluded(transaction_receipts::raw_receipt)),
+                transaction_receipts::updated_at.eq(Utc::now()),
+            ))
+            .get_result::<TransactionReceiptRow>(conn)
+            .context("upsert transaction receipt")?;
+
+        Ok(row.id)
+    }
+
     fn rebuild_balances(&self, conn: &mut PgConnection, source: &SourceRow) -> Result<()> {
         let rows = ledger_entries::table
             .filter(ledger_entries::source_id.eq(source.id))
@@ -1128,12 +1218,20 @@ fn movement_type(from: &str, to: &str) -> &'static str {
 }
 
 fn parse_optional_hex_i32(value: Option<&str>) -> Result<Option<i32>> {
-    value
-        .map(|value| {
-            let parsed = parse_hex_u64(value)?;
-            i32::try_from(parsed).with_context(|| format!("hex value {value} exceeds i32"))
-        })
-        .transpose()
+    value.map(parse_hex_i32).transpose()
+}
+
+fn parse_hex_i32(value: &str) -> Result<i32> {
+    let parsed = parse_hex_u64(value)?;
+    i32::try_from(parsed).with_context(|| format!("hex value {value} exceeds i32"))
+}
+
+fn parse_optional_hex_big_decimal(value: Option<&str>) -> Result<Option<BigDecimal>> {
+    value.map(parse_hex_big_decimal).transpose()
+}
+
+fn parse_hex_big_decimal(value: &str) -> Result<BigDecimal> {
+    Ok(BigDecimal::from(parse_hex_u64(value)?))
 }
 
 fn normalized_topics(log: &RpcLog) -> serde_json::Value {

@@ -7,7 +7,10 @@ use indexer_rs::{
     api,
     application::{
         backfill::{BackfillPlan, plan_backfill_jobs},
-        ingest::{ingest_source_range, normalize_address, redact_rpc_url, resolve_finalized_range},
+        ingest::{
+            IngestOptions, ingest_source_range, normalize_address, redact_rpc_url,
+            resolve_finalized_range,
+        },
     },
     domain::job::{JobStatus, JobType},
     infra::{
@@ -76,6 +79,10 @@ enum Commands {
         /// Maximum block span per eth_getLogs call.
         #[arg(long, default_value_t = 10)]
         chunk_size: u64,
+
+        /// Fetch and persist eth_getTransactionReceipt data for each unique transaction.
+        #[arg(long)]
+        include_transaction_receipts: bool,
     },
 
     /// Enqueue a durable ingestion job for a contract range.
@@ -250,6 +257,10 @@ enum WorkerCommands {
         /// Maximum block span per eth_getLogs call.
         #[arg(long, default_value_t = 10)]
         chunk_size: u64,
+
+        /// Fetch and persist eth_getTransactionReceipt data for each unique transaction.
+        #[arg(long)]
+        include_transaction_receipts: bool,
     },
 
     /// Continuously lease and execute queued ingestion jobs.
@@ -289,6 +300,10 @@ enum WorkerCommands {
         /// Sleep duration between empty queue polls.
         #[arg(long, default_value_t = 1_000)]
         idle_sleep_ms: u64,
+
+        /// Fetch and persist eth_getTransactionReceipt data for each unique transaction.
+        #[arg(long)]
+        include_transaction_receipts: bool,
     },
 }
 
@@ -332,6 +347,7 @@ async fn main() -> Result<()> {
             to_block,
             lookback,
             chunk_size,
+            include_transaction_receipts,
         } => {
             let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
 
@@ -347,6 +363,7 @@ async fn main() -> Result<()> {
                 to_block,
                 lookback,
                 chunk_size,
+                include_transaction_receipts,
             )
             .await
         }
@@ -432,6 +449,7 @@ async fn main() -> Result<()> {
                 chain_id,
                 lease_seconds,
                 chunk_size,
+                include_transaction_receipts,
             } => {
                 let rpc_url = rpc_url_from_args(rpc_url, chain_id)?;
                 worker_run_once(
@@ -441,6 +459,7 @@ async fn main() -> Result<()> {
                     chain_id,
                     lease_seconds,
                     chunk_size,
+                    include_transaction_receipts,
                 )
                 .await
             }
@@ -454,6 +473,7 @@ async fn main() -> Result<()> {
                 max_jobs,
                 stop_when_idle,
                 idle_sleep_ms,
+                include_transaction_receipts,
             } => {
                 let rpc_url = rpc_url_from_args(rpc_url, chain_id)?;
                 worker_run(
@@ -466,6 +486,7 @@ async fn main() -> Result<()> {
                     max_jobs,
                     stop_when_idle,
                     idle_sleep_ms,
+                    include_transaction_receipts,
                 )
                 .await
             }
@@ -504,6 +525,7 @@ async fn scan_contract(
     to_block: String,
     lookback: u64,
     chunk_size: u64,
+    include_transaction_receipts: bool,
 ) -> Result<()> {
     let standard = standard
         .parse::<TokenStandard>()
@@ -559,6 +581,9 @@ async fn scan_contract(
         range.from,
         range.to,
         chunk_size,
+        IngestOptions {
+            include_transaction_receipts,
+        },
     )
     .await?;
 
@@ -839,6 +864,7 @@ async fn worker_run_once(
     chain_id: Option<i64>,
     lease_seconds: i64,
     chunk_size: u64,
+    include_transaction_receipts: bool,
 ) -> Result<()> {
     if lease_seconds <= 0 {
         bail!("lease-seconds must be greater than zero");
@@ -851,6 +877,7 @@ async fn worker_run_once(
         chain_id,
         lease_seconds,
         chunk_size,
+        include_transaction_receipts,
     )?;
 
     let outcome = worker.run_once().await?;
@@ -875,6 +902,7 @@ async fn worker_run(
     max_jobs: Option<usize>,
     stop_when_idle: bool,
     idle_sleep_ms: u64,
+    include_transaction_receipts: bool,
 ) -> Result<()> {
     if max_jobs == Some(0) {
         bail!("max-jobs must be greater than zero when provided");
@@ -887,6 +915,7 @@ async fn worker_run(
         chain_id,
         lease_seconds,
         chunk_size,
+        include_transaction_receipts,
     )?;
     let mut attempted_jobs = 0usize;
     let mut printed_idle = false;
@@ -928,6 +957,7 @@ fn build_worker(
     chain_id: Option<i64>,
     lease_seconds: i64,
     chunk_size: u64,
+    include_transaction_receipts: bool,
 ) -> Result<IngestWorker> {
     if lease_seconds <= 0 {
         bail!("lease-seconds must be greater than zero");
@@ -944,7 +974,8 @@ fn build_worker(
         worker_id,
         Duration::seconds(lease_seconds),
         chunk_size,
-    );
+    )
+    .with_transaction_receipts(include_transaction_receipts);
     if let Some(chain_id) = chain_id {
         if chain_id <= 0 {
             bail!("chain-id must be greater than zero");
@@ -1064,6 +1095,10 @@ fn print_scan_summary(summary: &indexer_rs::infra::postgres::ledger_repository::
     println!(
         "Ledger entries persisted: {}",
         summary.ledger_entries_persisted
+    );
+    println!(
+        "Transaction receipts persisted: {}",
+        summary.transaction_receipts_persisted
     );
     println!("Current holders in indexed slice: {}", summary.holder_count);
     println!("Minters in indexed slice: {}", summary.minter_count);

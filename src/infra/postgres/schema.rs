@@ -149,6 +149,28 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    transaction_receipts (id) {
+        id -> Uuid,
+        chain_id -> Int8,
+        transaction_hash -> Text,
+        block_number -> Int8,
+        block_hash -> Text,
+        transaction_index -> Nullable<Int4>,
+        from_address -> Text,
+        to_address -> Nullable<Text>,
+        contract_address -> Nullable<Text>,
+        status -> Nullable<Int4>,
+        gas_used -> Numeric,
+        cumulative_gas_used -> Numeric,
+        effective_gas_price -> Nullable<Numeric>,
+        transaction_type -> Nullable<Text>,
+        raw_receipt -> Jsonb,
+        inserted_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(checkpoints -> sources (source_id));
 diesel::joinable!(events -> sources (source_id));
 diesel::joinable!(job_attempts -> jobs (job_id));
@@ -169,4 +191,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     reorg_events,
     sources,
     token_balances,
+    transaction_receipts,
 );

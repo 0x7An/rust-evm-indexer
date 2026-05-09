@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use super::schema::{
     chains, checkpoints, events, job_attempts, jobs, ledger_entries, reorg_events, sources,
-    token_balances,
+    token_balances, transaction_receipts,
 };
 
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
@@ -200,6 +200,48 @@ pub struct NewTokenBalanceRow {
     pub balance: BigDecimal,
     pub first_received_block: Option<i64>,
     pub last_moved_block: Option<i64>,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+#[diesel(table_name = transaction_receipts)]
+pub struct TransactionReceiptRow {
+    pub id: Uuid,
+    pub chain_id: i64,
+    pub transaction_hash: String,
+    pub block_number: i64,
+    pub block_hash: String,
+    pub transaction_index: Option<i32>,
+    pub from_address: String,
+    pub to_address: Option<String>,
+    pub contract_address: Option<String>,
+    pub status: Option<i32>,
+    pub gas_used: BigDecimal,
+    pub cumulative_gas_used: BigDecimal,
+    pub effective_gas_price: Option<BigDecimal>,
+    pub transaction_type: Option<String>,
+    pub raw_receipt: Value,
+    pub inserted_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = transaction_receipts)]
+pub struct NewTransactionReceiptRow {
+    pub id: Uuid,
+    pub chain_id: i64,
+    pub transaction_hash: String,
+    pub block_number: i64,
+    pub block_hash: String,
+    pub transaction_index: Option<i32>,
+    pub from_address: String,
+    pub to_address: Option<String>,
+    pub contract_address: Option<String>,
+    pub status: Option<i32>,
+    pub gas_used: BigDecimal,
+    pub cumulative_gas_used: BigDecimal,
+    pub effective_gas_price: Option<BigDecimal>,
+    pub transaction_type: Option<String>,
+    pub raw_receipt: Value,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable)]

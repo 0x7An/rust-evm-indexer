@@ -5,7 +5,7 @@ use chrono::Duration;
 use uuid::Uuid;
 
 use crate::{
-    application::ingest::ingest_source_range,
+    application::ingest::{IngestOptions, ingest_source_range},
     domain::job::{JobStatus, JobType},
     infra::{
         evm::rpc::EvmRpcClient,
@@ -23,6 +23,7 @@ pub struct IngestWorker {
     lease_for: Duration,
     chunk_size: u64,
     chain_id: Option<i64>,
+    include_transaction_receipts: bool,
 }
 
 impl IngestWorker {
@@ -40,11 +41,17 @@ impl IngestWorker {
             lease_for,
             chunk_size,
             chain_id: None,
+            include_transaction_receipts: false,
         }
     }
 
     pub fn with_chain_id(mut self, chain_id: i64) -> Self {
         self.chain_id = Some(chain_id);
+        self
+    }
+
+    pub fn with_transaction_receipts(mut self, include_transaction_receipts: bool) -> Self {
+        self.include_transaction_receipts = include_transaction_receipts;
         self
     }
 
@@ -167,6 +174,9 @@ impl IngestWorker {
             from as u64,
             to as u64,
             self.chunk_size,
+            IngestOptions {
+                include_transaction_receipts: self.include_transaction_receipts,
+            },
         )
         .await?;
 

@@ -1,6 +1,10 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use axum::{Json, Router, extract::State, routing::post};
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, Utc};
 use diesel::{Connection, PgConnection, RunQueryDsl, prelude::*};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
@@ -15,7 +19,9 @@ use indexer_rs::{
             connection::{PgPool, build_pool},
             job_repository::{EnqueueResult, NewJob},
             repositories::PostgresRepositories,
-            schema::{chains, events, jobs, ledger_entries, sources, token_balances},
+            schema::{
+                chains, events, jobs, ledger_entries, sources, token_balances, transaction_receipts,
+            },
         },
     },
     worker::{IngestWorker, WorkerOutcome, WorkerRunStopReason},
@@ -197,6 +203,92 @@ async fn worker_processes_queued_ingest_job() {
 }
 
 #[tokio::test]
+async fn worker_persists_transaction_receipts_when_enabled() {
+    let ctx = setup();
+    let (rpc_url, receipt_requests) = start_fake_rpc_with_receipts(ctx.contract.clone()).await;
+    ctx.repositories
+        .ledger()
+        .ensure_chain(
+            &format!("worker-receipt-test-chain-{}", ctx.chain_id),
+            ctx.chain_id,
+            "<test>",
+            12,
+        )
+        .expect("ensure chain");
+    let source = ctx
+        .repositories
+        .ledger()
+        .ensure_source(
+            ctx.chain_id,
+            "worker-receipt-test-source",
+            &ctx.contract,
+            TokenStandard::Erc721,
+            100,
+        )
+        .expect("ensure source");
+
+    ctx.repositories
+        .jobs()
+        .enqueue(
+            NewJob::new(
+                JobType::IngestRange,
+                ctx.chain_id,
+                format!("it:worker-receipt:{}:100:100", source.id),
+            )
+            .with_source(source.id)
+            .with_range(100, 100),
+        )
+        .expect("enqueue ingest job");
+
+    let worker = IngestWorker::new(
+        ctx.repositories.clone(),
+        EvmRpcClient::new(rpc_url),
+        "worker-receipt-it",
+        Duration::seconds(60),
+        10,
+    )
+    .with_chain_id(ctx.chain_id)
+    .with_transaction_receipts(true);
+    let outcome = worker.run_once().await.expect("run worker once");
+
+    let WorkerOutcome::Processed { summary, .. } = outcome else {
+        panic!("worker should process receipt job, got {outcome:?}");
+    };
+    assert_eq!(summary.transaction_receipts_persisted, 1);
+    assert_eq!(receipt_requests.load(Ordering::SeqCst), 1);
+
+    let mut conn = ctx.pool.get().expect("get postgres connection");
+    let (from_address, to_address, status, gas_used, effective_gas_price) =
+        transaction_receipts::table
+            .filter(transaction_receipts::chain_id.eq(ctx.chain_id))
+            .select((
+                transaction_receipts::from_address,
+                transaction_receipts::to_address,
+                transaction_receipts::status,
+                transaction_receipts::gas_used,
+                transaction_receipts::effective_gas_price,
+            ))
+            .first::<(
+                String,
+                Option<String>,
+                Option<i32>,
+                BigDecimal,
+                Option<BigDecimal>,
+            )>(&mut conn)
+            .expect("load transaction receipt");
+    assert_eq!(from_address, address("aa"));
+    assert_eq!(to_address, Some(ctx.contract.clone()));
+    assert_eq!(status, Some(1));
+    assert_eq!(gas_used.to_string(), "21000");
+    assert_eq!(
+        effective_gas_price
+            .expect("effective gas price")
+            .to_string(),
+        "1000000000"
+    );
+}
+
+#[tokio::test]
 async fn worker_returns_no_job_when_queue_is_empty() {
     let ctx = setup();
     let rpc_url = start_fake_rpc(ctx.contract.clone()).await;
@@ -291,8 +383,23 @@ async fn worker_runs_until_queue_is_idle() {
 }
 
 async fn start_fake_rpc(contract: String) -> String {
+    let (url, _) = start_fake_rpc_inner(contract, false).await;
+    url
+}
+
+async fn start_fake_rpc_with_receipts(contract: String) -> (String, Arc<AtomicUsize>) {
+    start_fake_rpc_inner(contract, true).await
+}
+
+async fn start_fake_rpc_inner(
+    contract: String,
+    support_receipts: bool,
+) -> (String, Arc<AtomicUsize>) {
+    let receipt_requests = Arc::new(AtomicUsize::new(0));
     let state = FakeRpcState {
         contract: Arc::new(contract),
+        support_receipts,
+        receipt_requests: Arc::clone(&receipt_requests),
     };
     let app = Router::new()
         .route("/", post(fake_rpc_handler))
@@ -306,12 +413,14 @@ async fn start_fake_rpc(contract: String) -> String {
         axum::serve(listener, app).await.expect("serve fake rpc");
     });
 
-    format!("http://{addr}")
+    (format!("http://{addr}"), receipt_requests)
 }
 
 #[derive(Clone)]
 struct FakeRpcState {
     contract: Arc<String>,
+    support_receipts: bool,
+    receipt_requests: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +445,13 @@ async fn fake_rpc_handler(
             &state.contract,
             requested_from_block(&request.params)
         )]),
+        "eth_getTransactionReceipt" if state.support_receipts => {
+            state.receipt_requests.fetch_add(1, Ordering::SeqCst);
+            json!(transaction_receipt(
+                &state.contract,
+                requested_transaction_hash(&request.params)
+            ))
+        }
         _ => {
             return Json(json!({
                 "jsonrpc": "2.0",
@@ -353,6 +469,23 @@ async fn fake_rpc_handler(
         "id": request.id,
         "result": result,
     }))
+}
+
+fn transaction_receipt(contract: &str, transaction_hash: &str) -> Value {
+    json!({
+        "transactionHash": transaction_hash,
+        "transactionIndex": "0x1",
+        "blockHash": format!("0x{}", "ef".repeat(32)),
+        "blockNumber": "0x64",
+        "from": address("aa"),
+        "to": contract,
+        "contractAddress": null,
+        "status": "0x1",
+        "gasUsed": "0x5208",
+        "cumulativeGasUsed": "0x5208",
+        "effectiveGasPrice": "0x3b9aca00",
+        "type": "0x2",
+    })
 }
 
 fn erc721_transfer_log(contract: &str, block_number: u64) -> Value {
@@ -377,6 +510,13 @@ fn block_timestamp_for(_block_number: u64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(1_609_459_200, 0).expect("test block timestamp")
 }
 
+fn requested_transaction_hash(params: &Value) -> &str {
+    params
+        .get(0)
+        .and_then(Value::as_str)
+        .expect("eth_getTransactionReceipt transaction hash")
+}
+
 fn requested_from_block(params: &Value) -> u64 {
     params
         .get(0)
@@ -391,7 +531,14 @@ fn topic_address_word(byte: &str) -> String {
     format!("0x{}{}", "00".repeat(12), byte.repeat(20))
 }
 
+fn address(byte: &str) -> String {
+    format!("0x{}", byte.repeat(20))
+}
+
 fn cleanup_chain(conn: &mut PgConnection, chain_id: i64) {
+    diesel::delete(transaction_receipts::table.filter(transaction_receipts::chain_id.eq(chain_id)))
+        .execute(conn)
+        .expect("delete test transaction receipts");
     diesel::delete(token_balances::table.filter(token_balances::chain_id.eq(chain_id)))
         .execute(conn)
         .expect("delete test balances");

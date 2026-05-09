@@ -1,0 +1,3 @@
+DROP INDEX idx_transaction_receipts_chain_from;
+DROP INDEX idx_transaction_receipts_chain_block;
+DROP TABLE transaction_receipts;
