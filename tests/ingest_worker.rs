@@ -383,6 +383,93 @@ async fn worker_runs_until_queue_is_idle() {
 }
 
 #[tokio::test]
+async fn worker_prioritizes_replay_jobs_over_ingest_jobs() {
+    let ctx = setup();
+    let rpc_url = start_fake_rpc(ctx.contract.clone()).await;
+    ctx.repositories
+        .ledger()
+        .ensure_chain(
+            &format!("worker-priority-test-chain-{}", ctx.chain_id),
+            ctx.chain_id,
+            "<test>",
+            12,
+        )
+        .expect("ensure chain");
+    let source = ctx
+        .repositories
+        .ledger()
+        .ensure_source(
+            ctx.chain_id,
+            "worker-priority-test-source",
+            &ctx.contract,
+            TokenStandard::Erc721,
+            100,
+        )
+        .expect("ensure source");
+    let ingest_job = ctx
+        .repositories
+        .jobs()
+        .enqueue(
+            NewJob::new(
+                JobType::IngestRange,
+                ctx.chain_id,
+                format!("it:worker-priority-ingest:{}:100:100", source.id),
+            )
+            .with_source(source.id)
+            .with_range(100, 100),
+        )
+        .expect("enqueue ingest job");
+    let replay_job = ctx
+        .repositories
+        .jobs()
+        .enqueue(
+            NewJob::new(
+                JobType::ReplayRange,
+                ctx.chain_id,
+                format!("it:worker-priority-replay:{}:101:101", source.id),
+            )
+            .with_source(source.id)
+            .with_range(101, 101),
+        )
+        .expect("enqueue replay job");
+    let ingest_job_id = enqueued_job_id(ingest_job);
+    let replay_job_id = enqueued_job_id(replay_job);
+
+    let worker = IngestWorker::new(
+        ctx.repositories.clone(),
+        EvmRpcClient::new(rpc_url),
+        "worker-priority-it",
+        Duration::seconds(60),
+        10,
+    )
+    .with_chain_id(ctx.chain_id);
+    let outcome = worker.run_once().await.expect("run worker once");
+
+    let WorkerOutcome::Processed { job_id, .. } = outcome else {
+        panic!("worker should process replay job, got {outcome:?}");
+    };
+    assert_eq!(job_id, replay_job_id);
+
+    let jobs = ctx
+        .repositories
+        .jobs()
+        .jobs_for_source(source.id)
+        .expect("load jobs");
+    let ingest_status = jobs
+        .iter()
+        .find(|job| job.id == ingest_job_id)
+        .map(|job| job.status.as_str())
+        .expect("ingest job exists");
+    let replay_status = jobs
+        .iter()
+        .find(|job| job.id == replay_job_id)
+        .map(|job| job.status.as_str())
+        .expect("replay job exists");
+    assert_eq!(ingest_status, JobStatus::Queued.as_str());
+    assert_eq!(replay_status, JobStatus::Succeeded.as_str());
+}
+
+#[tokio::test]
 async fn worker_replays_range_by_orphaning_existing_rows_and_ingesting_canonical_logs() {
     let ctx = setup();
     let rpc_url = start_fake_rpc(ctx.contract.clone()).await;
@@ -915,6 +1002,12 @@ fn cleanup_test_jobs(conn: &mut PgConnection) {
     diesel::sql_query("DELETE FROM jobs WHERE idempotency_key LIKE 'it:%'")
         .execute(conn)
         .expect("delete integration test jobs");
+}
+
+fn enqueued_job_id(result: EnqueueResult) -> Uuid {
+    match result {
+        EnqueueResult::Inserted(job) | EnqueueResult::Existing(job) => job.id,
+    }
 }
 
 fn random_chain_id() -> i64 {

@@ -107,13 +107,13 @@ impl IngestWorker {
         }
 
         let leased = match self
-            .lease_next_supported_type(JobType::IngestRange)
-            .context("lease next ingest job")?
+            .lease_next_supported_type(JobType::ReplayRange)
+            .context("lease next replay job")?
         {
             Some(job) => Some(job),
             None => self
-                .lease_next_supported_type(JobType::ReplayRange)
-                .context("lease next replay job")?,
+                .lease_next_supported_type(JobType::IngestRange)
+                .context("lease next ingest job")?,
         };
 
         let Some(leased) = leased else {

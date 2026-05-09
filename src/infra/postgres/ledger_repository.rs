@@ -283,6 +283,7 @@ impl LedgerRepository {
     ) -> Result<ScanSummary> {
         let mut conn = self.connection()?;
         conn.transaction::<ScanSummary, anyhow::Error, _>(|conn| {
+            self.lock_source_for_write_conn(conn, source)?;
             let mut events_persisted = 0;
             let mut ledger_entries_persisted = 0;
 
@@ -475,6 +476,7 @@ impl LedgerRepository {
 
         let mut conn = self.connection()?;
         conn.transaction::<OrphanRangeSummary, anyhow::Error, _>(|conn| {
+            self.lock_source_for_write_conn(conn, source)?;
             let rows = ledger_entries::table
                 .filter(ledger_entries::source_id.eq(source.id))
                 .filter(ledger_entries::block_number.ge(from_block))
@@ -1231,11 +1233,32 @@ impl LedgerRepository {
             collect_balance_delta(&mut deltas, current, false);
         }
 
+        let mut deltas = deltas.into_iter().collect::<Vec<_>>();
+        deltas.sort_by(
+            |((left_holder, left_token), _), ((right_holder, right_token), _)| {
+                left_holder
+                    .cmp(right_holder)
+                    .then_with(|| left_token.cmp(right_token))
+            },
+        );
+
         for ((holder_address, token_id), delta) in deltas {
             self.apply_holder_balance_delta(conn, source, holder_address, token_id, delta)?;
         }
 
         Ok(())
+    }
+
+    fn lock_source_for_write_conn(
+        &self,
+        conn: &mut PgConnection,
+        source: &SourceRow,
+    ) -> Result<()> {
+        diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+            .bind::<SqlBigInt, _>(source_advisory_lock_key(source.id))
+            .execute(conn)
+            .context("lock source ledger write")
+            .map(|_| ())
     }
 
     fn apply_holder_balance_delta(
@@ -1620,6 +1643,10 @@ fn movement_type(from: &str, to: &str) -> &'static str {
         (true, true) => "transfer",
         (false, false) => "transfer",
     }
+}
+
+fn source_advisory_lock_key(source_id: Uuid) -> i64 {
+    (source_id.as_u128() >> 64) as u64 as i64
 }
 
 fn parse_optional_hex_i32(value: Option<&str>) -> Result<Option<i32>> {
