@@ -303,6 +303,21 @@ cargo run -- backfill-event-metadata \
 This command refetches one-block log slices for indexed blocks missing metadata,
 then updates matching `events` and `ledger_entries` rows.
 
+Verify indexed block hashes against canonical RPC block hashes before replaying
+a suspicious range:
+
+```sh
+cargo run -- verify-reorg \
+  --chain-id 1 \
+  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
+  --from-block 12287507 \
+  --to-block 12300000
+```
+
+The verifier checks stored event block hashes and the source checkpoint hash
+when it falls inside the requested range. Mismatches are persisted to
+`reorg_events`; matching ranges leave that table unchanged.
+
 Drain a planned full-history backfill until the queue is empty:
 
 ```sh

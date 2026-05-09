@@ -6,3 +6,4 @@
 
 pub mod backfill;
 pub mod ingest;
+pub mod reorg;

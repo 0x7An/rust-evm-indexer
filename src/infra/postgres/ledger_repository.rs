@@ -28,11 +28,11 @@ use super::{
     connection::PgPool,
     models::{
         ChainRow, CheckpointRow, LedgerEntryRow, NewChainRow, NewCheckpointRow, NewEventRow,
-        NewLedgerEntryRow, NewSourceRow, NewTokenBalanceRow, NewTransactionReceiptRow, SourceRow,
-        TokenBalanceRow, TransactionReceiptRow,
+        NewLedgerEntryRow, NewReorgEventRow, NewSourceRow, NewTokenBalanceRow,
+        NewTransactionReceiptRow, ReorgEventRow, SourceRow, TokenBalanceRow, TransactionReceiptRow,
     },
     schema::{
-        chains, checkpoints, events, jobs, ledger_entries, sources, token_balances,
+        chains, checkpoints, events, jobs, ledger_entries, reorg_events, sources, token_balances,
         transaction_receipts,
     },
 };
@@ -106,6 +106,23 @@ pub struct LedgerTransfer {
 pub struct LogMetadataUpdate {
     pub events_updated: usize,
     pub ledger_entries_updated: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IndexedBlockHash {
+    pub block_number: i64,
+    pub block_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReorgEventInsert {
+    pub source_id: Uuid,
+    pub chain_id: i64,
+    pub from_block: i64,
+    pub to_block: i64,
+    pub expected_block_hash: Option<String>,
+    pub actual_block_hash: Option<String>,
+    pub replay_job_id: Option<Uuid>,
 }
 
 #[derive(Debug, QueryableByName)]
@@ -353,6 +370,66 @@ impl LedgerRepository {
             .first(&mut conn)
             .optional()
             .context("load checkpoint by source")
+    }
+
+    pub fn indexed_block_hashes(
+        &self,
+        source_id: Uuid,
+        from_block: i64,
+        to_block: i64,
+    ) -> Result<Vec<IndexedBlockHash>> {
+        let mut conn = self.connection()?;
+        events::table
+            .filter(events::source_id.eq(source_id))
+            .filter(events::orphaned.eq(false))
+            .filter(events::block_number.ge(from_block))
+            .filter(events::block_number.le(to_block))
+            .select((events::block_number, events::block_hash))
+            .distinct()
+            .order((events::block_number.asc(), events::block_hash.asc()))
+            .load::<(i64, String)>(&mut conn)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(block_number, block_hash)| IndexedBlockHash {
+                        block_number,
+                        block_hash,
+                    })
+                    .collect()
+            })
+            .context("load indexed block hashes")
+    }
+
+    pub fn record_reorg_event(&self, event: ReorgEventInsert) -> Result<ReorgEventRow> {
+        let mut conn = self.connection()?;
+        diesel::insert_into(reorg_events::table)
+            .values(NewReorgEventRow {
+                id: Uuid::new_v4(),
+                source_id: event.source_id,
+                chain_id: event.chain_id,
+                from_block: event.from_block,
+                to_block: event.to_block,
+                expected_block_hash: event
+                    .expected_block_hash
+                    .map(|value| value.to_ascii_lowercase()),
+                actual_block_hash: event
+                    .actual_block_hash
+                    .map(|value| value.to_ascii_lowercase()),
+                replay_job_id: event.replay_job_id,
+            })
+            .get_result(&mut conn)
+            .context("insert reorg event")
+    }
+
+    pub fn reorg_events_for_source(&self, source_id: Uuid) -> Result<Vec<ReorgEventRow>> {
+        let mut conn = self.connection()?;
+        reorg_events::table
+            .filter(reorg_events::source_id.eq(source_id))
+            .order((
+                reorg_events::from_block.asc(),
+                reorg_events::detected_at.asc(),
+            ))
+            .load(&mut conn)
+            .context("load reorg events for source")
     }
 
     pub fn event_blocks_missing_metadata(&self, source_id: Uuid, limit: i64) -> Result<Vec<i64>> {

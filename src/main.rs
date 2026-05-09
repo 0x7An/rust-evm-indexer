@@ -11,6 +11,7 @@ use indexer_rs::{
             IngestOptions, ingest_source_range, normalize_address, redact_rpc_url,
             resolve_finalized_range,
         },
+        reorg::verify_source_reorgs,
     },
     domain::job::{JobStatus, JobType},
     infra::{
@@ -231,6 +232,33 @@ enum Commands {
         /// Number of fetched receipts to persist per database transaction.
         #[arg(long, default_value_t = 100)]
         persist_batch_size: usize,
+    },
+
+    /// Verify indexed block hashes against canonical RPC block hashes.
+    VerifyReorg {
+        /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Postgres database URL. Prefer DATABASE_URL for local use.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+
+        /// EVM chain id for the indexed source.
+        #[arg(long, default_value_t = 1)]
+        chain_id: i64,
+
+        /// Contract address with indexed rows to verify.
+        #[arg(long)]
+        contract: String,
+
+        /// Inclusive start block to verify.
+        #[arg(long)]
+        from_block: u64,
+
+        /// Inclusive end block to verify.
+        #[arg(long)]
+        to_block: u64,
     },
 
     /// Run the HTTP read API for indexed ledger data.
@@ -484,6 +512,25 @@ async fn main() -> Result<()> {
                 contract,
                 limit,
                 persist_batch_size,
+            )
+            .await
+        }
+        Commands::VerifyReorg {
+            rpc_url,
+            database_url,
+            chain_id,
+            contract,
+            from_block,
+            to_block,
+        } => {
+            let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
+            verify_reorg(
+                rpc_url,
+                database_url,
+                chain_id,
+                contract,
+                from_block,
+                to_block,
             )
             .await
         }
@@ -1035,6 +1082,56 @@ async fn backfill_transaction_receipts(
     println!("Transaction receipt backfill complete.");
     println!("Receipts fetched: {fetched}");
     println!("Receipts persisted: {persisted}");
+
+    Ok(())
+}
+
+async fn verify_reorg(
+    rpc_url: String,
+    database_url: String,
+    chain_id: i64,
+    contract: String,
+    from_block: u64,
+    to_block: u64,
+) -> Result<()> {
+    let contract = normalize_address(&contract)?;
+    if chain_id <= 0 {
+        bail!("chain-id must be greater than zero");
+    }
+    if from_block > to_block {
+        bail!("from-block {from_block} cannot be greater than to-block {to_block}");
+    }
+
+    let pool = build_pool(&database_url).context("build postgres pool")?;
+    let repositories = PostgresRepositories::new(pool);
+    let source = repositories
+        .ledger()
+        .source_by_contract(chain_id, &contract)
+        .context("load source by contract")?
+        .context("contract source not found")?;
+    let rpc = EvmRpcClient::new(&rpc_url);
+    let verification =
+        verify_source_reorgs(&rpc, repositories.ledger(), &source, from_block, to_block).await?;
+
+    println!(
+        "Verified {} indexed/checkpointed block hashes for {contract} on chain {chain_id} over blocks {from_block}..={to_block}.",
+        verification.checked_blocks
+    );
+    if verification.mismatches.is_empty() {
+        println!("No reorg mismatches detected.");
+        return Ok(());
+    }
+
+    println!(
+        "Detected {} reorg mismatch(es) and persisted them to reorg_events:",
+        verification.mismatches.len()
+    );
+    for mismatch in verification.mismatches {
+        println!(
+            "- block {} expected {} actual {}",
+            mismatch.block_number, mismatch.expected_block_hash, mismatch.actual_block_hash
+        );
+    }
 
     Ok(())
 }
