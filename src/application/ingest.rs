@@ -91,17 +91,9 @@ pub async fn ingest_source_range(
         .context("detect source token standard")?;
     }
 
-    let code = rpc
-        .code_at(&source.contract_address, to)
-        .await
-        .with_context(|| format!("fetch contract code at block {to}"))?;
-    if code == "0x" {
-        bail!(
-            "no contract code at {} on chain {} at block {to}",
-            source.contract_address,
-            source.chain_id
-        );
-    }
+    let chain_label = format!("chain {}", source.chain_id);
+    validate_contract_code_at_boundaries(rpc, &source.contract_address, &chain_label, from, to)
+        .await?;
 
     let mut logs = fetch_logs_in_chunks_with_progress(
         rpc,
@@ -156,6 +148,42 @@ pub async fn fetch_logs_in_chunks(
     chunk_size: u64,
 ) -> Result<Vec<RpcLog>> {
     fetch_logs_in_chunks_with_progress(rpc, contract, standard, from, to, chunk_size, false).await
+}
+
+pub async fn validate_contract_code_at_boundaries(
+    rpc: &EvmRpcClient,
+    contract: &str,
+    chain_label: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    if from > to {
+        bail!("from-block {from} cannot be greater than to-block {to}");
+    }
+
+    validate_contract_code_at_block(rpc, contract, chain_label, from).await?;
+    if to != from {
+        validate_contract_code_at_block(rpc, contract, chain_label, to).await?;
+    }
+
+    Ok(())
+}
+
+async fn validate_contract_code_at_block(
+    rpc: &EvmRpcClient,
+    contract: &str,
+    chain_label: &str,
+    block: u64,
+) -> Result<()> {
+    let code = rpc
+        .code_at(contract, block)
+        .await
+        .with_context(|| format!("fetch contract code at block {block}"))?;
+    if code.trim() == "0x" {
+        bail!("no contract code at {contract} on {chain_label} at boundary block {block}");
+    }
+
+    Ok(())
 }
 
 pub async fn detect_token_standard(

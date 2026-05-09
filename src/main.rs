@@ -9,7 +9,7 @@ use indexer_rs::{
         backfill::{BackfillPlan, plan_backfill_jobs},
         ingest::{
             IngestOptions, detect_token_standard, ingest_source_range, normalize_address,
-            redact_rpc_url, resolve_finalized_range,
+            redact_rpc_url, resolve_finalized_range, validate_contract_code_at_boundaries,
         },
         reorg::verify_source_reorgs,
     },
@@ -721,6 +721,9 @@ async fn scan_contract(args: ScanContractArgs) -> Result<()> {
         finality_confirmations,
     )
     .await?;
+    let chain_label = format!("{chain_name} ({chain_id})");
+    validate_contract_code_at_boundaries(&rpc, &contract, &chain_label, range.from, range.to)
+        .await?;
     let standard = resolve_requested_standard(
         &rpc,
         &contract,
@@ -840,16 +843,9 @@ async fn enqueue_contract(args: EnqueueContractArgs) -> Result<()> {
         finality_confirmations,
     )
     .await?;
-    let code = rpc
-        .code_at(&contract, range.to)
-        .await
-        .with_context(|| format!("fetch contract code at block {}", range.to))?;
-    if code == "0x" {
-        bail!(
-            "no contract code at {contract} on {chain_name} ({chain_id}) at block {}",
-            range.to
-        );
-    }
+    let chain_label = format!("{chain_name} ({chain_id})");
+    validate_contract_code_at_boundaries(&rpc, &contract, &chain_label, range.from, range.to)
+        .await?;
     let standard = resolve_requested_standard(
         &rpc,
         &contract,
@@ -965,16 +961,9 @@ async fn backfill_contract(args: BackfillContractArgs) -> Result<()> {
         finality_confirmations,
     )
     .await?;
-    let code = rpc
-        .code_at(&contract, range.to)
-        .await
-        .with_context(|| format!("fetch contract code at block {}", range.to))?;
-    if code == "0x" {
-        bail!(
-            "no contract code at {contract} on {chain_name} ({chain_id}) at block {}",
-            range.to
-        );
-    }
+    let chain_label = format!("{chain_name} ({chain_id})");
+    validate_contract_code_at_boundaries(&rpc, &contract, &chain_label, range.from, range.to)
+        .await?;
     let standard = resolve_requested_standard(
         &rpc,
         &contract,

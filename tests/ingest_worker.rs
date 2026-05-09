@@ -477,8 +477,68 @@ async fn worker_replays_range_by_orphaning_existing_rows_and_ingesting_canonical
     assert_eq!(holders[0].balance, "1");
 }
 
+#[tokio::test]
+async fn worker_rejects_range_when_contract_code_is_missing_at_from_boundary() {
+    let ctx = setup();
+    let rpc_url = start_fake_rpc_with_missing_code(ctx.contract.clone(), 100).await;
+    ctx.repositories
+        .ledger()
+        .ensure_chain(
+            &format!("worker-code-boundary-test-chain-{}", ctx.chain_id),
+            ctx.chain_id,
+            "<test>",
+            12,
+        )
+        .expect("ensure chain");
+    let source = ctx
+        .repositories
+        .ledger()
+        .ensure_source(
+            ctx.chain_id,
+            "worker-code-boundary-test-source",
+            &ctx.contract,
+            TokenStandard::Erc721,
+            100,
+        )
+        .expect("ensure source");
+    ctx.repositories
+        .jobs()
+        .enqueue(
+            NewJob::new(
+                JobType::IngestRange,
+                ctx.chain_id,
+                format!("it:worker-code-boundary:{}:100:101", source.id),
+            )
+            .with_source(source.id)
+            .with_range(100, 101),
+        )
+        .expect("enqueue ingest job");
+
+    let worker = IngestWorker::new(
+        ctx.repositories.clone(),
+        EvmRpcClient::new(rpc_url),
+        "worker-code-boundary-it",
+        Duration::seconds(60),
+        10,
+    )
+    .with_chain_id(ctx.chain_id);
+    let outcome = worker.run_once().await.expect("run worker once");
+
+    let WorkerOutcome::Failed { error, .. } = outcome else {
+        panic!("worker should reject missing boundary code, got {outcome:?}");
+    };
+    assert!(error.contains("boundary block 100"));
+    assert!(error.contains(&ctx.contract));
+}
+
 async fn start_fake_rpc(contract: String) -> String {
     let (url, _) = start_fake_rpc_inner(contract, false).await;
+    url
+}
+
+async fn start_fake_rpc_with_missing_code(contract: String, missing_code_block: u64) -> String {
+    let (url, _) =
+        start_fake_rpc_inner_with_options(contract, false, Some(missing_code_block)).await;
     url
 }
 
@@ -490,11 +550,20 @@ async fn start_fake_rpc_inner(
     contract: String,
     support_receipts: bool,
 ) -> (String, Arc<AtomicUsize>) {
+    start_fake_rpc_inner_with_options(contract, support_receipts, None).await
+}
+
+async fn start_fake_rpc_inner_with_options(
+    contract: String,
+    support_receipts: bool,
+    missing_code_block: Option<u64>,
+) -> (String, Arc<AtomicUsize>) {
     let receipt_requests = Arc::new(AtomicUsize::new(0));
     let state = FakeRpcState {
         contract: Arc::new(contract),
         support_receipts,
         receipt_requests: Arc::clone(&receipt_requests),
+        missing_code_block,
     };
     let app = Router::new()
         .route("/", post(fake_rpc_handler))
@@ -516,6 +585,7 @@ struct FakeRpcState {
     contract: Arc<String>,
     support_receipts: bool,
     receipt_requests: Arc<AtomicUsize>,
+    missing_code_block: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -531,7 +601,13 @@ async fn fake_rpc_handler(
 ) -> Json<Value> {
     let result = match request.method.as_str() {
         "eth_blockNumber" => json!("0x78"),
-        "eth_getCode" => json!("0x6000"),
+        "eth_getCode" => {
+            if state.missing_code_block == Some(requested_block_param(&request.params, 1)) {
+                json!("0x")
+            } else {
+                json!("0x6000")
+            }
+        }
         "eth_getBlockByNumber" => json!({
             "hash": format!("0x{}", "ef".repeat(32)),
             "timestamp": "0x5fee6600",
@@ -649,6 +725,15 @@ fn requested_from_block(params: &Value) -> u64 {
         .and_then(|value| value.strip_prefix("0x"))
         .and_then(|value| u64::from_str_radix(value, 16).ok())
         .expect("eth_getLogs fromBlock")
+}
+
+fn requested_block_param(params: &Value, index: usize) -> u64 {
+    params
+        .get(index)
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix("0x"))
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+        .expect("hex block param")
 }
 
 fn topic_address_word(byte: &str) -> String {
