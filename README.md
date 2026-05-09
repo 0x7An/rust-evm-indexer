@@ -199,6 +199,13 @@ cargo run -- scan-contract \
 
 The default chunk size is 10 blocks so the command works with RPC providers that tightly limit `eth_getLogs` ranges. Increase `--chunk-size` when your provider plan allows wider log queries. The default `latest` end block resolves to `head - finality_confirmations`, and the command verifies that the contract has bytecode on the selected chain before printing decoded log counts, persisted ledger entries, minters, and current holders for the indexed block slice.
 
+Use `--standard auto` when you do not want to choose the token standard
+manually. The CLI scans the selected range for standard transfer logs, resolves
+ERC-20, ERC-721, or ERC-1155 from the first unambiguous evidence, and persists
+the concrete detected standard on the source. If the range has no standard
+transfer logs or the log shape is ambiguous, the command fails with a clear
+error instead of guessing.
+
 ## Durable Ingestion
 
 For the production-shaped path, enqueue a durable ingestion job instead of running the scan inline:

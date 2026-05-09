@@ -4,7 +4,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::infra::{
     evm::{
-        decoder::{RpcLog, TokenStandard, decode_log, parse_hex_u64},
+        decoder::{
+            RpcLog, TokenStandard, decode_log, detect_token_standard_from_log, parse_hex_u64,
+        },
         rpc::{EvmRpcClient, RpcTransactionReceipt},
     },
     postgres::{
@@ -72,10 +74,22 @@ pub async fn ingest_source_range(
         bail!("chunk-size must be greater than zero");
     }
 
-    let standard = source
+    let mut standard = source
         .token_standard
         .parse::<TokenStandard>()
         .with_context(|| format!("parse token standard {}", source.token_standard))?;
+    if standard.is_auto() {
+        standard = detect_token_standard(
+            rpc,
+            &source.contract_address,
+            from,
+            to,
+            chunk_size,
+            options.progress,
+        )
+        .await
+        .context("detect source token standard")?;
+    }
 
     let code = rpc
         .code_at(&source.contract_address, to)
@@ -142,6 +156,78 @@ pub async fn fetch_logs_in_chunks(
     chunk_size: u64,
 ) -> Result<Vec<RpcLog>> {
     fetch_logs_in_chunks_with_progress(rpc, contract, standard, from, to, chunk_size, false).await
+}
+
+pub async fn detect_token_standard(
+    rpc: &EvmRpcClient,
+    contract: &str,
+    from: u64,
+    to: u64,
+    chunk_size: u64,
+    progress: bool,
+) -> Result<TokenStandard> {
+    if from > to {
+        bail!("from-block {from} cannot be greater than to-block {to}");
+    }
+    if chunk_size == 0 {
+        bail!("chunk-size must be greater than zero");
+    }
+
+    let mut chunk_from = from;
+    let total_chunks = (((to - from) / chunk_size) + 1) as usize;
+    let mut chunk_number = 0usize;
+
+    while chunk_from <= to {
+        let chunk_to = chunk_from.saturating_add(chunk_size - 1).min(to);
+        chunk_number += 1;
+        let logs = rpc
+            .logs(contract, TokenStandard::Auto, chunk_from, chunk_to)
+            .await
+            .with_context(|| {
+                format!(
+                    "fetch contract logs for token standard detection {chunk_from}..={chunk_to}"
+                )
+            })?;
+        if let Some(standard) = detect_token_standard_from_logs(&logs)? {
+            return Ok(standard);
+        }
+        if progress && should_report_progress(chunk_number, total_chunks) {
+            println!(
+                "Checked token standard detection chunk {chunk_number}/{total_chunks} for blocks {chunk_from}..={chunk_to}."
+            );
+        }
+
+        if chunk_to == u64::MAX {
+            break;
+        }
+        chunk_from = chunk_to + 1;
+    }
+
+    bail!(
+        "could not auto-detect token standard for {contract} over blocks {from}..={to}; \
+         no ERC-20, ERC-721, or ERC-1155 transfer logs were found"
+    )
+}
+
+pub fn detect_token_standard_from_logs(logs: &[RpcLog]) -> Result<Option<TokenStandard>> {
+    let mut detected: Option<TokenStandard> = None;
+    for log in logs {
+        let Some(candidate) = detect_token_standard_from_log(log)? else {
+            continue;
+        };
+        if let Some(existing) = detected {
+            if existing != candidate {
+                bail!(
+                    "conflicting token standards detected in logs: {} and {}",
+                    existing.as_str(),
+                    candidate.as_str()
+                );
+            }
+        } else {
+            detected = Some(candidate);
+        }
+    }
+    Ok(detected)
 }
 
 async fn fetch_logs_in_chunks_with_progress(
@@ -296,6 +382,7 @@ pub fn redact_rpc_url(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::evm::decoder::event_topic;
 
     #[test]
     fn redacts_provider_key_from_rpc_url() {
@@ -303,5 +390,86 @@ mod tests {
             redact_rpc_url("https://eth-mainnet.g.alchemy.com/v2/example-key"),
             "https://eth-mainnet.g.alchemy.com/v2/<redacted>"
         );
+    }
+
+    #[test]
+    fn detects_erc721_from_auto_transfer_shape() {
+        let logs = vec![test_log(
+            vec![
+                event_topic("Transfer(address,address,uint256)"),
+                topic_address_word("11"),
+                topic_address_word("22"),
+                format!("0x{:064x}", 42),
+            ],
+            "0x",
+        )];
+
+        assert_eq!(
+            detect_token_standard_from_logs(&logs).unwrap(),
+            Some(TokenStandard::Erc721)
+        );
+    }
+
+    #[test]
+    fn detects_erc20_from_auto_transfer_shape() {
+        let logs = vec![test_log(
+            vec![
+                event_topic("Transfer(address,address,uint256)"),
+                topic_address_word("11"),
+                topic_address_word("22"),
+            ],
+            &format!("0x{:064x}", 1_000),
+        )];
+
+        assert_eq!(
+            detect_token_standard_from_logs(&logs).unwrap(),
+            Some(TokenStandard::Erc20)
+        );
+    }
+
+    #[test]
+    fn detects_erc1155_from_auto_transfer_shape() {
+        let logs = vec![test_log(
+            vec![
+                event_topic("TransferSingle(address,address,address,uint256,uint256)"),
+                topic_address_word("11"),
+                topic_address_word("22"),
+                topic_address_word("33"),
+            ],
+            &format!("0x{:064x}{:064x}", 42, 3),
+        )];
+
+        assert_eq!(
+            detect_token_standard_from_logs(&logs).unwrap(),
+            Some(TokenStandard::Erc1155)
+        );
+    }
+
+    #[test]
+    fn auto_detection_returns_none_without_supported_logs() {
+        let logs = vec![test_log(
+            vec![event_topic("Approval(address,address,uint256)")],
+            "0x",
+        )];
+
+        assert_eq!(detect_token_standard_from_logs(&logs).unwrap(), None);
+    }
+
+    fn topic_address_word(byte: &str) -> String {
+        format!("0x{}{}", "00".repeat(12), byte.repeat(20))
+    }
+
+    fn test_log(topics: Vec<String>, data: &str) -> RpcLog {
+        RpcLog {
+            address: "0x1000000000000000000000000000000000000000".to_string(),
+            topics,
+            data: data.to_string(),
+            block_number: "0x1".to_string(),
+            transaction_hash: format!("0x{}", "aa".repeat(32)),
+            transaction_index: Some("0x0".to_string()),
+            log_index: "0x0".to_string(),
+            block_hash: format!("0x{}", "bb".repeat(32)),
+            block_timestamp: None,
+        }
     }
 }

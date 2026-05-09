@@ -7,6 +7,7 @@ use sha3::{Digest, Keccak256};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TokenStandard {
+    Auto,
     Erc20,
     Erc721,
     Erc1155,
@@ -15,10 +16,15 @@ pub enum TokenStandard {
 impl TokenStandard {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Erc20 => "erc20",
             Self::Erc721 => "erc721",
             Self::Erc1155 => "erc1155",
         }
+    }
+
+    pub fn is_auto(self) -> bool {
+        self == Self::Auto
     }
 }
 
@@ -27,6 +33,7 @@ impl std::str::FromStr for TokenStandard {
 
     fn from_str(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
             "erc20" => Ok(Self::Erc20),
             "erc721" => Ok(Self::Erc721),
             "erc1155" => Ok(Self::Erc1155),
@@ -71,6 +78,11 @@ pub struct DecodedLog {
 
 pub fn supported_topic0_values(standard: TokenStandard) -> Vec<String> {
     match standard {
+        TokenStandard::Auto => vec![
+            event_topic("Transfer(address,address,uint256)"),
+            event_topic("TransferSingle(address,address,address,uint256,uint256)"),
+            event_topic("TransferBatch(address,address,address,uint256[],uint256[])"),
+        ],
         TokenStandard::Erc20 | TokenStandard::Erc721 => {
             vec![event_topic("Transfer(address,address,uint256)")]
         }
@@ -82,6 +94,15 @@ pub fn supported_topic0_values(standard: TokenStandard) -> Vec<String> {
 }
 
 pub fn decode_log(log: &RpcLog, standard: TokenStandard) -> Result<Option<DecodedLog>> {
+    let standard = if standard.is_auto() {
+        let Some(detected) = detect_token_standard_from_log(log)? else {
+            return Ok(None);
+        };
+        detected
+    } else {
+        standard
+    };
+
     let Some(topic0) = log.topics.first() else {
         return Ok(None);
     };
@@ -101,6 +122,38 @@ pub fn decode_log(log: &RpcLog, standard: TokenStandard) -> Result<Option<Decode
 
     if topic0 == transfer_batch && standard == TokenStandard::Erc1155 {
         return decode_transfer_batch(log).map(Some);
+    }
+
+    Ok(None)
+}
+
+pub fn detect_token_standard_from_log(log: &RpcLog) -> Result<Option<TokenStandard>> {
+    let Some(topic0) = log.topics.first() else {
+        return Ok(None);
+    };
+
+    let topic0 = topic0.to_ascii_lowercase();
+    let transfer = event_topic("Transfer(address,address,uint256)");
+    let transfer_single = event_topic("TransferSingle(address,address,address,uint256,uint256)");
+    let transfer_batch = event_topic("TransferBatch(address,address,address,uint256[],uint256[])");
+
+    if topic0 == transfer_single || topic0 == transfer_batch {
+        return Ok(Some(TokenStandard::Erc1155));
+    }
+
+    if topic0 == transfer {
+        let data_words = data_word_count(&log.data)?;
+        return match (log.topics.len(), data_words) {
+            (4, 0) => Ok(Some(TokenStandard::Erc721)),
+            (3, 1) => Ok(Some(TokenStandard::Erc20)),
+            _ => bail!(
+                "cannot auto-detect token standard from Transfer log {}: expected ERC-721 shape \
+                 with 4 topics and empty data or ERC-20 shape with 3 topics and one data word; \
+                 got {} topics and {data_words} data words",
+                log.transaction_hash,
+                log.topics.len()
+            ),
+        };
     }
 
     Ok(None)
@@ -137,6 +190,7 @@ fn decode_transfer(log: &RpcLog, standard: TokenStandard) -> Result<DecodedLog> 
                 "1".to_string(),
             )
         }
+        TokenStandard::Auto => unreachable!("auto must be resolved before decoding Transfer"),
         TokenStandard::Erc1155 => unreachable!("ERC-1155 transfer uses dedicated events"),
     };
 
@@ -259,6 +313,14 @@ fn decode_data_words(data: &str) -> Result<Vec<String>> {
         .chunks(64)
         .map(|chunk| std::str::from_utf8(chunk).expect("hex is utf8").to_string())
         .collect())
+}
+
+fn data_word_count(data: &str) -> Result<usize> {
+    let data = strip_0x(data)?;
+    if data.len() % 64 != 0 {
+        bail!("ABI data length must be a multiple of 32 bytes");
+    }
+    Ok(data.len() / 64)
 }
 
 fn decode_dynamic_uint_array(words: &[String], offset_bytes: usize) -> Result<Vec<String>> {

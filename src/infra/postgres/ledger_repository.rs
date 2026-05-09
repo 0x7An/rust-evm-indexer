@@ -220,6 +220,10 @@ impl LedgerRepository {
         standard: TokenStandard,
         start_block: i64,
     ) -> Result<SourceRow> {
+        if standard.is_auto() {
+            anyhow::bail!("source token standard must be detected before persistence");
+        }
+
         let mut conn = self.connection()?;
         diesel::insert_into(sources::table)
             .values(NewSourceRow {
@@ -229,6 +233,9 @@ impl LedgerRepository {
                 contract_address: contract_address.to_ascii_lowercase(),
                 token_standard: standard.as_str().to_string(),
                 event_signatures: match standard {
+                    TokenStandard::Auto => {
+                        unreachable!("auto token standard is rejected before source persistence")
+                    }
                     TokenStandard::Erc20 | TokenStandard::Erc721 => {
                         json!(["Transfer(address,address,uint256)"])
                     }

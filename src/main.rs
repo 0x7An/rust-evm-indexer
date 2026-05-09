@@ -8,8 +8,8 @@ use indexer_rs::{
     application::{
         backfill::{BackfillPlan, plan_backfill_jobs},
         ingest::{
-            IngestOptions, ingest_source_range, normalize_address, redact_rpc_url,
-            resolve_finalized_range,
+            IngestOptions, detect_token_standard, ingest_source_range, normalize_address,
+            redact_rpc_url, resolve_finalized_range,
         },
         reorg::verify_source_reorgs,
     },
@@ -24,6 +24,8 @@ use indexer_rs::{
     },
     worker::{IngestWorker, WorkerOutcome},
 };
+
+const AUTO_DETECT_CHUNK_SIZE: u64 = 2_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "indexer")]
@@ -61,7 +63,7 @@ enum Commands {
         #[arg(long)]
         contract: String,
 
-        /// Token standard: erc20, erc721, or erc1155.
+        /// Token standard: auto, erc20, erc721, or erc1155.
         #[arg(long)]
         standard: String,
 
@@ -112,7 +114,7 @@ enum Commands {
         #[arg(long)]
         contract: String,
 
-        /// Token standard: erc20, erc721, or erc1155.
+        /// Token standard: auto, erc20, erc721, or erc1155.
         #[arg(long)]
         standard: String,
 
@@ -159,7 +161,7 @@ enum Commands {
         #[arg(long)]
         contract: String,
 
-        /// Token standard: erc20, erc721, or erc1155.
+        /// Token standard: auto, erc20, erc721, or erc1155.
         #[arg(long)]
         standard: String,
 
@@ -664,6 +666,28 @@ struct ScanContractArgs {
     include_transaction_receipts: bool,
 }
 
+async fn resolve_requested_standard(
+    rpc: &EvmRpcClient,
+    contract: &str,
+    requested: TokenStandard,
+    from: u64,
+    to: u64,
+    chunk_size: u64,
+) -> Result<TokenStandard> {
+    if !requested.is_auto() {
+        return Ok(requested);
+    }
+
+    let detected = detect_token_standard(rpc, contract, from, to, chunk_size, true)
+        .await
+        .context("auto-detect token standard")?;
+    println!(
+        "Detected token standard for {contract} over blocks {from}..={to}: {}",
+        detected.as_str()
+    );
+    Ok(detected)
+}
+
 async fn scan_contract(args: ScanContractArgs) -> Result<()> {
     let ScanContractArgs {
         rpc_url,
@@ -680,7 +704,7 @@ async fn scan_contract(args: ScanContractArgs) -> Result<()> {
         include_transaction_receipts,
     } = args;
 
-    let standard = standard
+    let requested_standard = standard
         .parse::<TokenStandard>()
         .with_context(|| format!("parse token standard {standard}"))?;
     let contract = normalize_address(&contract)?;
@@ -695,6 +719,15 @@ async fn scan_contract(args: ScanContractArgs) -> Result<()> {
         &to_block,
         lookback,
         finality_confirmations,
+    )
+    .await?;
+    let standard = resolve_requested_standard(
+        &rpc,
+        &contract,
+        requested_standard,
+        range.from,
+        range.to,
+        chunk_size,
     )
     .await?;
 
@@ -787,7 +820,7 @@ async fn enqueue_contract(args: EnqueueContractArgs) -> Result<()> {
         max_attempts,
     } = args;
 
-    let standard = standard
+    let requested_standard = standard
         .parse::<TokenStandard>()
         .with_context(|| format!("parse token standard {standard}"))?;
     let contract = normalize_address(&contract)?;
@@ -817,6 +850,15 @@ async fn enqueue_contract(args: EnqueueContractArgs) -> Result<()> {
             range.to
         );
     }
+    let standard = resolve_requested_standard(
+        &rpc,
+        &contract,
+        requested_standard,
+        range.from,
+        range.to,
+        AUTO_DETECT_CHUNK_SIZE,
+    )
+    .await?;
 
     let pool = build_pool(&database_url).context("build postgres pool")?;
     let repositories = PostgresRepositories::new(pool);
@@ -900,7 +942,7 @@ async fn backfill_contract(args: BackfillContractArgs) -> Result<()> {
         max_attempts,
     } = args;
 
-    let standard = standard
+    let requested_standard = standard
         .parse::<TokenStandard>()
         .with_context(|| format!("parse token standard {standard}"))?;
     let contract = normalize_address(&contract)?;
@@ -933,6 +975,15 @@ async fn backfill_contract(args: BackfillContractArgs) -> Result<()> {
             range.to
         );
     }
+    let standard = resolve_requested_standard(
+        &rpc,
+        &contract,
+        requested_standard,
+        range.from,
+        range.to,
+        range_size,
+    )
+    .await?;
 
     let pool = build_pool(&database_url).context("build postgres pool")?;
     let repositories = PostgresRepositories::new(pool);
