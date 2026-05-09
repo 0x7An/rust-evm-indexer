@@ -25,7 +25,7 @@ use indexer_rs::{
     worker::{IngestWorker, WorkerOutcome},
 };
 
-const AUTO_DETECT_CHUNK_SIZE: u64 = 2_000;
+const AUTO_DETECT_CHUNK_SIZE: u64 = 10;
 
 #[derive(Debug, Parser)]
 #[command(name = "indexer")]
@@ -971,7 +971,7 @@ async fn backfill_contract(args: BackfillContractArgs) -> Result<()> {
         requested_standard,
         range.from,
         range.to,
-        range_size,
+        AUTO_DETECT_CHUNK_SIZE,
     )
     .await?;
 

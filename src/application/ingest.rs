@@ -253,7 +253,9 @@ pub fn detect_token_standard_from_logs(logs: &[RpcLog]) -> Result<Option<TokenSt
         if let Some(existing) = detected {
             if existing != candidate {
                 bail!(
-                    "conflicting token standards detected in logs: {} and {}",
+                    "conflicting token standards detected in logs: {} and {}; pass --standard \
+                     erc20, --standard erc721, or --standard erc1155 explicitly for hybrid \
+                     contracts",
                     existing.as_str(),
                     candidate.as_str()
                 );
@@ -488,6 +490,32 @@ mod tests {
         )];
 
         assert_eq!(detect_token_standard_from_logs(&logs).unwrap(), None);
+    }
+
+    #[test]
+    fn auto_detection_reports_explicit_standard_for_hybrid_logs() {
+        let logs = vec![
+            test_log(
+                vec![
+                    event_topic("Transfer(address,address,uint256)"),
+                    topic_address_word("11"),
+                    topic_address_word("22"),
+                ],
+                &format!("0x{:064x}", 1_000),
+            ),
+            test_log(
+                vec![
+                    event_topic("Transfer(address,address,uint256)"),
+                    topic_address_word("11"),
+                    topic_address_word("22"),
+                    format!("0x{:064x}", 42),
+                ],
+                "0x",
+            ),
+        ];
+
+        let err = detect_token_standard_from_logs(&logs).unwrap_err();
+        assert!(err.to_string().contains("pass --standard"));
     }
 
     fn topic_address_word(byte: &str) -> String {

@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use diesel::{
     PgConnection, QueryableByName,
     prelude::*,
-    sql_types::{BigInt as SqlBigInt, Text as SqlText, Uuid as SqlUuid},
+    sql_types::{BigInt as SqlBigInt, Nullable, Text as SqlText, Timestamptz, Uuid as SqlUuid},
     upsert::excluded,
 };
 use serde::Serialize;
@@ -140,6 +140,28 @@ pub struct ReorgEventInsert {
 struct MissingReceiptHashRow {
     #[diesel(sql_type = SqlText)]
     transaction_hash: String,
+}
+
+#[derive(Debug, QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = SqlBigInt)]
+    count: i64,
+}
+
+#[derive(Debug, QueryableByName)]
+struct MinterSummaryRow {
+    #[diesel(sql_type = SqlText)]
+    minter_address: String,
+    #[diesel(sql_type = SqlBigInt)]
+    mint_count: i64,
+    #[diesel(sql_type = SqlBigInt)]
+    first_mint_block: i64,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    first_mint_timestamp: Option<DateTime<Utc>>,
+    #[diesel(sql_type = SqlBigInt)]
+    last_mint_block: i64,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    last_mint_timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -816,62 +838,8 @@ impl LedgerRepository {
             return Ok(None);
         };
 
-        let rows = ledger_entries::table
-            .filter(ledger_entries::source_id.eq(source.id))
-            .filter(ledger_entries::movement_type.eq("mint"))
-            .filter(ledger_entries::orphaned.eq(false))
-            .order((
-                ledger_entries::block_number.asc(),
-                ledger_entries::log_index.asc(),
-                ledger_entries::batch_index.asc(),
-            ))
-            .load::<LedgerEntryRow>(&mut conn)
-            .context("load minter ledger entries")?;
-
-        let mut minters: HashMap<String, MinterAccumulator> = HashMap::new();
-        for row in rows {
-            let Some(address) = row.to_address else {
-                continue;
-            };
-            let entry = minters.entry(address).or_insert_with(|| MinterAccumulator {
-                mint_count: 0,
-                first_mint_block: row.block_number,
-                first_mint_timestamp: row.block_timestamp,
-                last_mint_block: row.block_number,
-                last_mint_timestamp: row.block_timestamp,
-            });
-            entry.mint_count += 1;
-            if row.block_number < entry.first_mint_block {
-                entry.first_mint_block = row.block_number;
-                entry.first_mint_timestamp = row.block_timestamp;
-            }
-            if row.block_number > entry.last_mint_block {
-                entry.last_mint_block = row.block_number;
-                entry.last_mint_timestamp = row.block_timestamp;
-            }
-        }
-
-        let mut summaries = minters
-            .into_iter()
-            .map(|(minter_address, value)| MinterSummary {
-                minter_address,
-                mint_count: value.mint_count,
-                first_mint_block: value.first_mint_block,
-                first_mint_timestamp: value.first_mint_timestamp,
-                last_mint_block: value.last_mint_block,
-                last_mint_timestamp: value.last_mint_timestamp,
-            })
-            .collect::<Vec<_>>();
-        summaries.sort_by(|left, right| {
-            right
-                .mint_count
-                .cmp(&left.mint_count)
-                .then_with(|| left.first_mint_block.cmp(&right.first_mint_block))
-                .then_with(|| left.minter_address.cmp(&right.minter_address))
-        });
-        summaries.truncate(clamp_limit(limit) as usize);
-
-        Ok(Some(summaries))
+        let rows = self.top_minters_conn(&mut conn, source.id, clamp_limit(limit))?;
+        Ok(Some(rows))
     }
 
     pub fn transfers(
@@ -1344,16 +1312,90 @@ impl LedgerRepository {
     }
 
     fn minter_count_conn(&self, conn: &mut PgConnection, source_id: Uuid) -> Result<i64> {
-        let minters = ledger_entries::table
-            .filter(ledger_entries::source_id.eq(source_id))
-            .filter(ledger_entries::movement_type.eq("mint"))
-            .filter(ledger_entries::orphaned.eq(false))
-            .select(ledger_entries::to_address)
-            .distinct()
-            .load::<Option<String>>(conn)
-            .context("load distinct minters")?;
+        diesel::sql_query(
+            "SELECT COUNT(DISTINCT to_address) AS count
+             FROM ledger_entries
+             WHERE source_id = $1
+               AND movement_type = 'mint'
+               AND orphaned = false
+               AND to_address IS NOT NULL",
+        )
+        .bind::<SqlUuid, _>(source_id)
+        .get_result::<CountRow>(conn)
+        .map(|row| row.count)
+        .context("count distinct minters")
+    }
 
-        Ok(minters.into_iter().flatten().count() as i64)
+    fn top_minters_conn(
+        &self,
+        conn: &mut PgConnection,
+        source_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<MinterSummary>> {
+        diesel::sql_query(
+            "WITH minter_blocks AS (
+                SELECT
+                    to_address AS minter_address,
+                    COUNT(*)::bigint AS mint_count,
+                    MIN(block_number) AS first_mint_block,
+                    MAX(block_number) AS last_mint_block
+                FROM ledger_entries
+                WHERE source_id = $1
+                  AND movement_type = 'mint'
+                  AND orphaned = false
+                  AND to_address IS NOT NULL
+                GROUP BY to_address
+                ORDER BY COUNT(*) DESC, MIN(block_number) ASC, to_address ASC
+                LIMIT $2
+             )
+             SELECT
+                mb.minter_address AS minter_address,
+                mb.mint_count AS mint_count,
+                mb.first_mint_block AS first_mint_block,
+                first_entry.block_timestamp AS first_mint_timestamp,
+                mb.last_mint_block AS last_mint_block,
+                last_entry.block_timestamp AS last_mint_timestamp
+             FROM minter_blocks mb
+             LEFT JOIN LATERAL (
+                SELECT block_timestamp
+                FROM ledger_entries
+                WHERE source_id = $1
+                  AND movement_type = 'mint'
+                  AND orphaned = false
+                  AND to_address = mb.minter_address
+                  AND block_number = mb.first_mint_block
+                ORDER BY log_index ASC, batch_index ASC
+                LIMIT 1
+             ) first_entry ON true
+             LEFT JOIN LATERAL (
+                SELECT block_timestamp
+                FROM ledger_entries
+                WHERE source_id = $1
+                  AND movement_type = 'mint'
+                  AND orphaned = false
+                  AND to_address = mb.minter_address
+                  AND block_number = mb.last_mint_block
+                ORDER BY log_index DESC, batch_index DESC
+                LIMIT 1
+             ) last_entry ON true
+             ORDER BY mb.mint_count DESC, mb.first_mint_block ASC, mb.minter_address ASC",
+        )
+        .bind::<SqlUuid, _>(source_id)
+        .bind::<SqlBigInt, _>(limit.clamp(1, 100))
+        .load::<MinterSummaryRow>(conn)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| MinterSummary {
+                    minter_address: row.minter_address,
+                    mint_count: row.mint_count,
+                    first_mint_block: row.first_mint_block,
+                    first_mint_timestamp: row.first_mint_timestamp,
+                    last_mint_block: row.last_mint_block,
+                    last_mint_timestamp: row.last_mint_timestamp,
+                })
+                .collect()
+        })
+        .context("load top minters")
     }
 
     fn top_holders_conn(
@@ -1518,15 +1560,6 @@ impl Default for BalanceDelta {
             last_moved_block: None,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct MinterAccumulator {
-    mint_count: i64,
-    first_mint_block: i64,
-    first_mint_timestamp: Option<DateTime<Utc>>,
-    last_mint_block: i64,
-    last_mint_timestamp: Option<DateTime<Utc>>,
 }
 
 fn collect_balance_delta(
