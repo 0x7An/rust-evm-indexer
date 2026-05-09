@@ -1,9 +1,16 @@
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::decoder::{RpcLog, TokenStandard, supported_topic0_values};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockMetadata {
+    pub hash: String,
+    pub timestamp: DateTime<Utc>,
+}
 
 #[derive(Clone)]
 pub struct EvmRpcClient {
@@ -41,6 +48,14 @@ impl EvmRpcClient {
     }
 
     pub async fn block_hash(&self, block: u64) -> Result<String> {
+        Ok(self.block_metadata(block).await?.hash)
+    }
+
+    pub async fn block_timestamp(&self, block: u64) -> Result<DateTime<Utc>> {
+        Ok(self.block_metadata(block).await?.timestamp)
+    }
+
+    pub async fn block_metadata(&self, block: u64) -> Result<BlockMetadata> {
         let value = self
             .call(
                 "eth_getBlockByNumber",
@@ -48,11 +63,23 @@ impl EvmRpcClient {
             )
             .await?;
 
-        value
+        let hash = value
             .get("hash")
             .and_then(Value::as_str)
             .map(str::to_ascii_lowercase)
-            .ok_or_else(|| anyhow::anyhow!("eth_getBlockByNumber result missing hash"))
+            .ok_or_else(|| anyhow::anyhow!("eth_getBlockByNumber result missing hash"))?;
+        let timestamp_hex = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("eth_getBlockByNumber result missing timestamp"))?;
+        let timestamp_seconds = super::decoder::parse_hex_u64(timestamp_hex)
+            .with_context(|| format!("parse block timestamp for block {block}"))?;
+        let timestamp_seconds = i64::try_from(timestamp_seconds)
+            .with_context(|| format!("block {block} timestamp is too large"))?;
+        let timestamp = DateTime::<Utc>::from_timestamp(timestamp_seconds, 0)
+            .ok_or_else(|| anyhow::anyhow!("block {block} timestamp is out of range"))?;
+
+        Ok(BlockMetadata { hash, timestamp })
     }
 
     pub async fn logs(

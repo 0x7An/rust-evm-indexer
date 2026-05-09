@@ -88,14 +88,15 @@ This repository is intended to grow through small, reviewable checkpoints:
 8. Contract backfill planning and checkpoints
 9. Continuous worker loop and job status CLI
 10. Paginated ledger queries
-11. Repair/replay support
-12. Observability and doctor CLI
+11. Event block/log metadata
+12. Repair/replay support
+13. Observability and doctor CLI
 
 Each checkpoint should keep the project buildable, include focused validation, and produce a clear commit/PR boundary.
 
 ## Current Status
 
-Checkpoint 10 is complete. The project currently contains the public Rust skeleton, pure domain model, initial Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, and a cursor-paginated read API for querying indexed ledger slices. Repair/replay support and observability will be introduced in later checkpoints.
+Checkpoint 11 is complete. The project currently contains the public Rust skeleton, pure domain model, Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, cursor-paginated read APIs, and event block/log metadata for querying ledger history by real on-chain time. Repair/replay support and observability will be introduced in later checkpoints.
 
 ## Development
 
@@ -242,6 +243,21 @@ cargo run -- backfill-contract \
 
 Backfill jobs use idempotency keys based on `source_id`, `from_block`, and `to_block`, so rerunning the same command reports existing jobs instead of duplicating work. After a worker successfully ingests a range, it advances the checkpoint only across contiguous completed ranges, so progress does not skip gaps when jobs finish out of order.
 
+Newly ingested events persist both ingestion time and on-chain event metadata:
+`block_timestamp`, `transaction_index`, raw `topics`, and raw `data`. If rows were
+indexed before these columns existed, repair them without re-indexing decoded
+ledger entries:
+
+```sh
+cargo run -- backfill-event-metadata \
+  --chain-id 1 \
+  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
+  --limit-blocks 100
+```
+
+This command refetches one-block log slices for indexed blocks missing metadata,
+then updates matching `events` and `ledger_entries` rows.
+
 Drain a planned full-history backfill until the queue is empty:
 
 ```sh
@@ -319,6 +335,10 @@ Recent ledger transfers:
 ```sh
 curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/transfers?limit=25"
 ```
+
+Transfer and token-path items include `block_timestamp` and `transaction_index`
+alongside block, transaction hash, log index, token id, amount, and movement
+addresses.
 
 Transfers can be filtered and paged with a stable cursor:
 

@@ -176,6 +176,29 @@ enum Commands {
         max_attempts: i32,
     },
 
+    /// Repair event block timestamps and raw log metadata for already indexed rows.
+    BackfillEventMetadata {
+        /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Postgres database URL. Prefer DATABASE_URL for local use.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+
+        /// EVM chain id for the indexed source.
+        #[arg(long, default_value_t = 1)]
+        chain_id: i64,
+
+        /// Contract address with indexed events to repair.
+        #[arg(long)]
+        contract: String,
+
+        /// Maximum distinct event blocks to repair in one run.
+        #[arg(long, default_value_t = 100)]
+        limit_blocks: i64,
+    },
+
     /// Run the HTTP read API for indexed ledger data.
     Serve {
         /// Postgres database URL. Prefer DATABASE_URL for local use.
@@ -388,6 +411,17 @@ async fn main() -> Result<()> {
                 max_attempts,
             )
             .await
+        }
+        Commands::BackfillEventMetadata {
+            rpc_url,
+            database_url,
+            chain_id,
+            contract,
+            limit_blocks,
+        } => {
+            let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
+
+            backfill_event_metadata(rpc_url, database_url, chain_id, contract, limit_blocks).await
         }
         Commands::Serve { database_url, bind } => serve_api(database_url, bind).await,
         Commands::Worker { command } => match command {
@@ -719,6 +753,81 @@ async fn backfill_contract(
         max_attempts,
     )?;
     print_backfill_plan(&source.contract_address, &chain_name, chain_id, &plan);
+
+    Ok(())
+}
+
+async fn backfill_event_metadata(
+    rpc_url: String,
+    database_url: String,
+    chain_id: i64,
+    contract: String,
+    limit_blocks: i64,
+) -> Result<()> {
+    let contract = normalize_address(&contract)?;
+    if chain_id <= 0 {
+        bail!("chain-id must be greater than zero");
+    }
+    if limit_blocks <= 0 {
+        bail!("limit-blocks must be greater than zero");
+    }
+
+    let pool = build_pool(&database_url).context("build postgres pool")?;
+    let repositories = PostgresRepositories::new(pool);
+    let source = repositories
+        .ledger()
+        .source_by_contract(chain_id, &contract)
+        .context("load source by contract")?
+        .context("contract source not found")?;
+    let standard = source
+        .token_standard
+        .parse::<TokenStandard>()
+        .with_context(|| format!("parse token standard {}", source.token_standard))?;
+    let blocks = repositories
+        .ledger()
+        .event_blocks_missing_metadata(source.id, limit_blocks)
+        .context("load blocks missing metadata")?;
+
+    if blocks.is_empty() {
+        println!("No indexed event rows are missing block/log metadata for {contract}.");
+        return Ok(());
+    }
+
+    let rpc = EvmRpcClient::new(&rpc_url);
+    let mut rpc_logs_seen = 0usize;
+    let mut events_updated = 0usize;
+    let mut ledger_entries_updated = 0usize;
+
+    for block in &blocks {
+        let block = u64::try_from(*block).context("indexed block number cannot be negative")?;
+        let timestamp = rpc
+            .block_timestamp(block)
+            .await
+            .with_context(|| format!("fetch block timestamp for block {block}"))?;
+        let mut logs = rpc
+            .logs(&source.contract_address, standard, block, block)
+            .await
+            .with_context(|| format!("fetch contract logs for block {block}"))?;
+
+        rpc_logs_seen += logs.len();
+        for log in &mut logs {
+            log.block_timestamp = Some(timestamp.to_owned());
+            let update = repositories
+                .ledger()
+                .update_log_metadata(&source, log)
+                .context("update indexed log metadata")?;
+            events_updated += update.events_updated;
+            ledger_entries_updated += update.ledger_entries_updated;
+        }
+    }
+
+    println!(
+        "Backfilled event metadata for {contract} on chain {chain_id} across {blocks} blocks.",
+        blocks = blocks.len()
+    );
+    println!("RPC logs inspected: {rpc_logs_seen}");
+    println!("Event rows updated: {events_updated}");
+    println!("Ledger rows updated: {ledger_entries_updated}");
 
     Ok(())
 }

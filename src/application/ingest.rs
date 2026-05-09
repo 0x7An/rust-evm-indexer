@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, bail};
 
 use crate::infra::{
     evm::{
-        decoder::{RpcLog, TokenStandard, decode_log},
+        decoder::{RpcLog, TokenStandard, decode_log, parse_hex_u64},
         rpc::EvmRpcClient,
     },
     postgres::{
@@ -80,7 +82,7 @@ pub async fn ingest_source_range(
         );
     }
 
-    let logs = fetch_logs_in_chunks(
+    let mut logs = fetch_logs_in_chunks(
         rpc,
         &source.contract_address,
         standard,
@@ -89,6 +91,8 @@ pub async fn ingest_source_range(
         chunk_size,
     )
     .await?;
+    attach_block_timestamps(rpc, &mut logs).await?;
+
     let mut decoded = Vec::new();
     for log in logs {
         if let Some(decoded_log) = decode_log(&log, standard).context("decode log")? {
@@ -127,6 +131,29 @@ pub async fn fetch_logs_in_chunks(
     }
 
     Ok(logs)
+}
+
+async fn attach_block_timestamps(rpc: &EvmRpcClient, logs: &mut [RpcLog]) -> Result<()> {
+    let mut timestamps = BTreeMap::new();
+    for log in logs.iter() {
+        let block = parse_hex_u64(&log.block_number).context("parse log block number")?;
+        timestamps.entry(block).or_insert(None);
+    }
+
+    for (block, timestamp) in timestamps.iter_mut() {
+        *timestamp = Some(
+            rpc.block_timestamp(*block)
+                .await
+                .with_context(|| format!("fetch block timestamp for block {block}"))?,
+        );
+    }
+
+    for log in logs {
+        let block = parse_hex_u64(&log.block_number).context("parse log block number")?;
+        log.block_timestamp = timestamps.get(&block).cloned().flatten();
+    }
+
+    Ok(())
 }
 
 pub fn parse_block_arg(value: &str, latest: u64) -> Result<u64> {

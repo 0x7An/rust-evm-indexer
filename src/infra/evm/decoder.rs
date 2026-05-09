@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bigdecimal::num_bigint::BigUint;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
@@ -42,8 +43,12 @@ pub struct RpcLog {
     pub data: String,
     pub block_number: String,
     pub transaction_hash: String,
+    #[serde(default)]
+    pub transaction_index: Option<String>,
     pub log_index: String,
     pub block_hash: String,
+    #[serde(skip)]
+    pub block_timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,8 +341,10 @@ mod tests {
             data: "0x".to_string(),
             block_number: "0x1".to_string(),
             transaction_hash: format!("0x{}", "33".repeat(32)),
+            transaction_index: Some("0x0".to_string()),
             log_index: "0x0".to_string(),
             block_hash: format!("0x{}", "44".repeat(32)),
+            block_timestamp: None,
         };
 
         let decoded = decode_log(&log, TokenStandard::Erc721).unwrap().unwrap();

@@ -5,6 +5,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use chrono::{DateTime, Utc};
 use diesel::{Connection, PgConnection, prelude::*};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use indexer_rs::{
@@ -140,6 +141,8 @@ async fn exposes_summary_holders_minters_transfers_and_token_path() {
     let transfers = transfers["items"].as_array().expect("transfer items");
     assert_eq!(transfers.len(), 2);
     assert_eq!(transfers[0]["block_number"], 102);
+    assert_eq!(transfers[0]["block_timestamp"], "2021-01-01T00:01:42Z");
+    assert_eq!(transfers[0]["transaction_index"], 2);
     assert_eq!(transfers[1]["block_number"], 101);
 
     let path_uri = format!(
@@ -375,8 +378,10 @@ fn transfer_log(
             data: "0x".to_string(),
             block_number: format!("0x{block_number:x}"),
             transaction_hash: format!("0x{}", tx_byte.repeat(32)),
+            transaction_index: Some("0x2".to_string()),
             log_index: format!("0x{log_index:x}"),
             block_hash: format!("0x{}", "aa".repeat(32)),
+            block_timestamp: Some(block_timestamp(block_number)),
         },
         DecodedLog {
             event_name: "Transfer".to_string(),
@@ -392,6 +397,11 @@ fn transfer_log(
             }],
         },
     )
+}
+
+fn block_timestamp(block_number: u64) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(1_609_459_200 + block_number as i64, 0)
+        .expect("test block timestamp")
 }
 
 fn cleanup_chain(conn: &mut PgConnection, chain_id: i64) {

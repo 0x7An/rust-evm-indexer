@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use bigdecimal::{BigDecimal, Zero};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use diesel::{PgConnection, prelude::*, upsert::excluded};
 use serde::Serialize;
 use serde_json::json;
@@ -65,7 +65,9 @@ pub struct MinterSummary {
     pub minter_address: String,
     pub mint_count: i64,
     pub first_mint_block: i64,
+    pub first_mint_timestamp: Option<DateTime<Utc>>,
     pub last_mint_block: i64,
+    pub last_mint_timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -77,9 +79,17 @@ pub struct LedgerTransfer {
     pub token_id: String,
     pub amount: String,
     pub block_number: i64,
+    pub block_timestamp: Option<DateTime<Utc>>,
     pub transaction_hash: String,
+    pub transaction_index: Option<i32>,
     pub log_index: i32,
     pub batch_index: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogMetadataUpdate {
+    pub events_updated: usize,
+    pub ledger_entries_updated: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -254,6 +264,80 @@ impl LedgerRepository {
             .first(&mut conn)
             .optional()
             .context("load checkpoint by source")
+    }
+
+    pub fn event_blocks_missing_metadata(&self, source_id: Uuid, limit: i64) -> Result<Vec<i64>> {
+        let mut conn = self.connection()?;
+        events::table
+            .filter(events::source_id.eq(source_id))
+            .filter(
+                events::block_timestamp
+                    .is_null()
+                    .or(events::transaction_index.is_null())
+                    .or(events::topics.eq(json!([]))),
+            )
+            .select(events::block_number)
+            .distinct()
+            .order(events::block_number.asc())
+            .limit(limit.clamp(1, 10_000))
+            .load(&mut conn)
+            .context("load event blocks missing metadata")
+    }
+
+    pub fn update_log_metadata(
+        &self,
+        source: &SourceRow,
+        log: &RpcLog,
+    ) -> Result<LogMetadataUpdate> {
+        let mut conn = self.connection()?;
+        conn.transaction::<LogMetadataUpdate, anyhow::Error, _>(|conn| {
+            let transaction_hash = log.transaction_hash.to_ascii_lowercase();
+            let log_index = parse_hex_u64(&log.log_index)? as i32;
+            let block_number = parse_hex_u64(&log.block_number)? as i64;
+            let block_timestamp = log.block_timestamp.to_owned();
+            let block_hash = log.block_hash.to_ascii_lowercase();
+            let transaction_index = parse_optional_hex_i32(log.transaction_index.as_deref())?;
+
+            let events_updated = diesel::update(
+                events::table
+                    .filter(events::source_id.eq(source.id))
+                    .filter(events::chain_id.eq(source.chain_id))
+                    .filter(events::transaction_hash.eq(&transaction_hash))
+                    .filter(events::log_index.eq(log_index)),
+            )
+            .set((
+                events::block_number.eq(block_number),
+                events::block_timestamp.eq(block_timestamp),
+                events::block_hash.eq(&block_hash),
+                events::transaction_index.eq(transaction_index),
+                events::contract_address.eq(log.address.to_ascii_lowercase()),
+                events::topics.eq(normalized_topics(log)),
+                events::data.eq(log.data.to_ascii_lowercase()),
+            ))
+            .execute(conn)
+            .context("update event log metadata")?;
+
+            let ledger_entries_updated = diesel::update(
+                ledger_entries::table
+                    .filter(ledger_entries::source_id.eq(source.id))
+                    .filter(ledger_entries::chain_id.eq(source.chain_id))
+                    .filter(ledger_entries::transaction_hash.eq(transaction_hash))
+                    .filter(ledger_entries::log_index.eq(log_index)),
+            )
+            .set((
+                ledger_entries::block_number.eq(block_number),
+                ledger_entries::block_timestamp.eq(block_timestamp),
+                ledger_entries::block_hash.eq(block_hash),
+                ledger_entries::transaction_index.eq(transaction_index),
+            ))
+            .execute(conn)
+            .context("update ledger entry log metadata")?;
+
+            Ok(LogMetadataUpdate {
+                events_updated,
+                ledger_entries_updated,
+            })
+        })
     }
 
     pub fn advance_checkpoint(
@@ -475,11 +559,19 @@ impl LedgerRepository {
             let entry = minters.entry(address).or_insert_with(|| MinterAccumulator {
                 mint_count: 0,
                 first_mint_block: row.block_number,
+                first_mint_timestamp: row.block_timestamp,
                 last_mint_block: row.block_number,
+                last_mint_timestamp: row.block_timestamp,
             });
             entry.mint_count += 1;
-            entry.first_mint_block = entry.first_mint_block.min(row.block_number);
-            entry.last_mint_block = entry.last_mint_block.max(row.block_number);
+            if row.block_number < entry.first_mint_block {
+                entry.first_mint_block = row.block_number;
+                entry.first_mint_timestamp = row.block_timestamp;
+            }
+            if row.block_number > entry.last_mint_block {
+                entry.last_mint_block = row.block_number;
+                entry.last_mint_timestamp = row.block_timestamp;
+            }
         }
 
         let mut summaries = minters
@@ -488,7 +580,9 @@ impl LedgerRepository {
                 minter_address,
                 mint_count: value.mint_count,
                 first_mint_block: value.first_mint_block,
+                first_mint_timestamp: value.first_mint_timestamp,
                 last_mint_block: value.last_mint_block,
+                last_mint_timestamp: value.last_mint_timestamp,
             })
             .collect::<Vec<_>>();
         summaries.sort_by(|left, right| {
@@ -604,11 +698,15 @@ impl LedgerRepository {
                 source_id: source.id,
                 chain_id: source.chain_id,
                 block_number: parse_hex_u64(&log.block_number)? as i64,
+                block_timestamp: log.block_timestamp.to_owned(),
                 block_hash: log.block_hash.to_ascii_lowercase(),
                 transaction_hash: log.transaction_hash.to_ascii_lowercase(),
+                transaction_index: parse_optional_hex_i32(log.transaction_index.as_deref())?,
                 log_index: parse_hex_u64(&log.log_index)? as i32,
                 contract_address: log.address.to_ascii_lowercase(),
                 event_name: decoded.event_name.clone(),
+                topics: normalized_topics(log),
+                data: log.data.to_ascii_lowercase(),
                 args: json!({
                     "entries": decoded.entries.iter().map(|entry| {
                         json!({
@@ -633,6 +731,13 @@ impl LedgerRepository {
             ))
             .do_update()
             .set((
+                events::block_timestamp.eq(excluded(events::block_timestamp)),
+                events::block_hash.eq(excluded(events::block_hash)),
+                events::transaction_index.eq(excluded(events::transaction_index)),
+                events::contract_address.eq(excluded(events::contract_address)),
+                events::event_name.eq(excluded(events::event_name)),
+                events::topics.eq(excluded(events::topics)),
+                events::data.eq(excluded(events::data)),
                 events::args.eq(excluded(events::args)),
                 events::finalized.eq(true),
                 events::orphaned.eq(false),
@@ -676,8 +781,10 @@ impl LedgerRepository {
                 amount,
                 batch_index: entry.batch_index,
                 block_number: parse_hex_u64(&log.block_number)? as i64,
+                block_timestamp: log.block_timestamp.to_owned(),
                 block_hash: log.block_hash.to_ascii_lowercase(),
                 transaction_hash: log.transaction_hash.to_ascii_lowercase(),
+                transaction_index: parse_optional_hex_i32(log.transaction_index.as_deref())?,
                 log_index: parse_hex_u64(&log.log_index)? as i32,
                 orphaned: false,
             })
@@ -690,6 +797,9 @@ impl LedgerRepository {
             .do_update()
             .set((
                 ledger_entries::amount.eq(excluded(ledger_entries::amount)),
+                ledger_entries::block_timestamp.eq(excluded(ledger_entries::block_timestamp)),
+                ledger_entries::block_hash.eq(excluded(ledger_entries::block_hash)),
+                ledger_entries::transaction_index.eq(excluded(ledger_entries::transaction_index)),
                 ledger_entries::orphaned.eq(false),
             ))
             .get_result::<LedgerEntryRow>(conn)
@@ -950,7 +1060,9 @@ impl Default for BalanceAccumulator {
 struct MinterAccumulator {
     mint_count: i64,
     first_mint_block: i64,
+    first_mint_timestamp: Option<DateTime<Utc>>,
     last_mint_block: i64,
+    last_mint_timestamp: Option<DateTime<Utc>>,
 }
 
 impl From<TokenBalanceRow> for HolderBalance {
@@ -975,7 +1087,9 @@ impl From<LedgerEntryRow> for LedgerTransfer {
             token_id: row.token_id,
             amount: row.amount.to_string(),
             block_number: row.block_number,
+            block_timestamp: row.block_timestamp,
             transaction_hash: row.transaction_hash,
+            transaction_index: row.transaction_index,
             log_index: row.log_index,
             batch_index: row.batch_index,
         }
@@ -1011,6 +1125,24 @@ fn movement_type(from: &str, to: &str) -> &'static str {
         (true, true) => "transfer",
         (false, false) => "transfer",
     }
+}
+
+fn parse_optional_hex_i32(value: Option<&str>) -> Result<Option<i32>> {
+    value
+        .map(|value| {
+            let parsed = parse_hex_u64(value)?;
+            i32::try_from(parsed).with_context(|| format!("hex value {value} exceeds i32"))
+        })
+        .transpose()
+}
+
+fn normalized_topics(log: &RpcLog) -> serde_json::Value {
+    json!(
+        log.topics
+            .iter()
+            .map(|topic| topic.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    )
 }
 
 const TOKEN_BALANCE_INSERT_CHUNK_SIZE: usize = 1_000;

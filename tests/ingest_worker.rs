@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::{Json, Router, extract::State, routing::post};
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use diesel::{Connection, PgConnection, RunQueryDsl, prelude::*};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use indexer_rs::{
@@ -166,6 +166,22 @@ async fn worker_processes_queued_ingest_job() {
     assert_eq!(contract_summary.checkpoint_processed_block, Some(100));
     assert_eq!(contract_summary.checkpoint_finalized_block, Some(100));
 
+    let mut conn = ctx.pool.get().expect("get postgres connection");
+    let (block_timestamp, transaction_index, topics, data) = events::table
+        .filter(events::source_id.eq(source.id))
+        .select((
+            events::block_timestamp,
+            events::transaction_index,
+            events::topics,
+            events::data,
+        ))
+        .first::<(Option<DateTime<Utc>>, Option<i32>, Value, String)>(&mut conn)
+        .expect("load persisted event metadata");
+    assert_eq!(block_timestamp, Some(block_timestamp_for(100)));
+    assert_eq!(transaction_index, Some(1));
+    assert_eq!(topics.as_array().expect("topics").len(), 4);
+    assert_eq!(data, "0x");
+
     let checkpoint = ctx
         .repositories
         .ledger()
@@ -314,6 +330,7 @@ async fn fake_rpc_handler(
         "eth_getCode" => json!("0x6000"),
         "eth_getBlockByNumber" => json!({
             "hash": format!("0x{}", "ef".repeat(32)),
+            "timestamp": "0x5fee6600",
         }),
         "eth_getLogs" => json!([erc721_transfer_log(
             &state.contract,
@@ -350,9 +367,14 @@ fn erc721_transfer_log(contract: &str, block_number: u64) -> Value {
         "data": "0x",
         "blockNumber": format!("0x{block_number:x}"),
         "transactionHash": format!("0x{block_number:064x}"),
+        "transactionIndex": "0x1",
         "logIndex": "0x0",
         "blockHash": format!("0x{:064x}", block_number + 1),
     })
+}
+
+fn block_timestamp_for(_block_number: u64) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(1_609_459_200, 0).expect("test block timestamp")
 }
 
 fn requested_from_block(params: &Value) -> u64 {
