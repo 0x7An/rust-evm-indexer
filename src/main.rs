@@ -263,7 +263,7 @@ enum Commands {
         persist_batch_size: usize,
     },
 
-    /// Verify indexed block hashes against canonical RPC block hashes.
+    /// Verify indexed block hashes against canonical RPC block hashes without auto-replaying.
     VerifyReorg {
         /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
         #[arg(long)]
@@ -1264,7 +1264,7 @@ async fn verify_reorg(
     }
 
     println!(
-        "Detected {} reorg mismatch(es) and persisted them to reorg_events:",
+        "Detected {} reorg mismatch(es) and persisted affected range(s) to reorg_events:",
         verification.mismatches.len()
     );
     for mismatch in verification.mismatches {
@@ -1273,6 +1273,9 @@ async fn verify_reorg(
             mismatch.block_number, mismatch.expected_block_hash, mismatch.actual_block_hash
         );
     }
+    println!(
+        "Review the affected range(s), then enqueue REPLAY_RANGE manually with enqueue-replay."
+    );
 
     Ok(())
 }

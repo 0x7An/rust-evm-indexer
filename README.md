@@ -323,7 +323,9 @@ cargo run -- verify-reorg \
 
 The verifier checks stored event block hashes and the source checkpoint hash
 when it falls inside the requested range. Mismatches are persisted to
-`reorg_events`; matching ranges leave that table unchanged.
+`reorg_events` as contiguous affected ranges; matching ranges leave that table
+unchanged. `verify-reorg` does not enqueue replay automatically. That manual
+gate keeps corrective replay explicit after the operator reviews the mismatch.
 
 After confirming a mismatch, enqueue a replay job for the affected range:
 

@@ -66,17 +66,6 @@ pub async fn verify_source_reorgs(
             .to_ascii_lowercase();
         let expected_hash = indexed.block_hash.to_ascii_lowercase();
         if expected_hash != actual {
-            ledger
-                .record_reorg_event(ReorgEventInsert {
-                    source_id: source.id,
-                    chain_id: source.chain_id,
-                    from_block: indexed.block_number,
-                    to_block: indexed.block_number,
-                    expected_block_hash: Some(expected_hash.clone()),
-                    actual_block_hash: Some(actual.clone()),
-                    replay_job_id: None,
-                })
-                .context("record reorg event")?;
             mismatches.push(ReorgMismatch {
                 block_number: indexed.block_number,
                 expected_block_hash: expected_hash,
@@ -84,10 +73,55 @@ pub async fn verify_source_reorgs(
             });
         }
     }
+    record_reorg_ranges(ledger, source, &mismatches)?;
 
     Ok(ReorgVerification {
         source_id: source.id,
         checked_blocks,
         mismatches,
     })
+}
+
+fn record_reorg_ranges(
+    ledger: &LedgerRepository,
+    source: &SourceRow,
+    mismatches: &[ReorgMismatch],
+) -> Result<()> {
+    let Some(first) = mismatches.first() else {
+        return Ok(());
+    };
+
+    let mut range_start = first;
+    let mut previous = first;
+    for mismatch in &mismatches[1..] {
+        if mismatch.block_number == previous.block_number + 1 {
+            previous = mismatch;
+            continue;
+        }
+
+        record_reorg_range(ledger, source, range_start, previous)?;
+        range_start = mismatch;
+        previous = mismatch;
+    }
+    record_reorg_range(ledger, source, range_start, previous)
+}
+
+fn record_reorg_range(
+    ledger: &LedgerRepository,
+    source: &SourceRow,
+    first: &ReorgMismatch,
+    last: &ReorgMismatch,
+) -> Result<()> {
+    ledger
+        .record_reorg_event(ReorgEventInsert {
+            source_id: source.id,
+            chain_id: source.chain_id,
+            from_block: first.block_number,
+            to_block: last.block_number,
+            expected_block_hash: Some(first.expected_block_hash.clone()),
+            actual_block_hash: Some(first.actual_block_hash.clone()),
+            replay_job_id: None,
+        })
+        .context("record reorg event")
+        .map(|_| ())
 }

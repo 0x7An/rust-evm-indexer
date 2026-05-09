@@ -125,9 +125,19 @@ async fn records_mismatched_indexed_and_checkpoint_hashes() {
         .ledger()
         .reorg_events_for_source(source.id)
         .expect("load reorg events");
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 1);
     assert!(rows.iter().all(|row| row.chain_id == ctx.chain_id));
-    assert!(rows.iter().all(|row| row.from_block == row.to_block));
+    assert_eq!(rows[0].from_block, 100);
+    assert_eq!(rows[0].to_block, 101);
+    assert_eq!(
+        rows[0].expected_block_hash.as_deref(),
+        Some(block_hash("11").as_str())
+    );
+    assert_eq!(
+        rows[0].actual_block_hash.as_deref(),
+        Some(block_hash("aa").as_str())
+    );
+    assert!(rows[0].replay_job_id.is_none());
 }
 
 #[tokio::test]
