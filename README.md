@@ -97,7 +97,7 @@ Each checkpoint should keep the project buildable, include focused validation, a
 
 ## Current Status
 
-Checkpoint 12 is complete. The project currently contains the public Rust skeleton, pure domain model, Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, cursor-paginated read APIs, event block/log metadata for querying ledger history by real on-chain time, optional transaction receipt ingestion for transaction sender/status/gas provenance, and repair commands for metadata or receipt gaps. Replay support and observability will be introduced in later checkpoints.
+Checkpoint 12 is complete. The project currently contains the public Rust skeleton, pure domain model, Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, cursor-paginated read APIs, incremental holder balance materialization, event block/log metadata for querying ledger history by real on-chain time, optional transaction receipt ingestion for transaction sender/status/gas provenance, and repair commands for metadata or receipt gaps. Replay support and observability will be introduced in later checkpoints.
 
 ## Development
 

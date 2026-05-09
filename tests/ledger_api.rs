@@ -346,6 +346,72 @@ async fn lists_transaction_hashes_missing_receipts() {
     );
 }
 
+#[tokio::test]
+async fn reprocessing_logs_does_not_double_count_balances() {
+    let ctx = setup();
+    let repo = LedgerRepository::new(ctx.pool.clone());
+    let source = repo
+        .source_by_contract(ctx.chain_id, &ctx.contract)
+        .expect("load source")
+        .expect("source exists");
+    let logs = seeded_logs(&ctx.contract);
+
+    let summary = repo
+        .persist_decoded_logs(&source, &logs)
+        .expect("reprocess decoded logs");
+    assert_eq!(summary.holder_count, 2);
+
+    let holders = repo
+        .holders(ctx.chain_id, &ctx.contract, 10)
+        .expect("load holders")
+        .expect("holders exist");
+    assert_eq!(holders.len(), 2);
+    assert!(holders.iter().any(|holder| {
+        holder.holder_address == address("22") && holder.token_id == "42" && holder.balance == "1"
+    }));
+    assert!(holders.iter().any(|holder| {
+        holder.holder_address == address("33") && holder.token_id == "7" && holder.balance == "1"
+    }));
+    assert!(
+        holders
+            .iter()
+            .all(|holder| holder.holder_address != address("11"))
+    );
+}
+
+#[tokio::test]
+async fn rejects_balance_updates_that_would_go_negative() {
+    let ctx = setup();
+    let repo = LedgerRepository::new(ctx.pool.clone());
+    let source = repo
+        .source_by_contract(ctx.chain_id, &ctx.contract)
+        .expect("load source")
+        .expect("source exists");
+    let logs = vec![transfer_log(
+        &ctx.contract,
+        103,
+        "04",
+        0,
+        &address("44"),
+        &address("55"),
+        "999",
+    )];
+
+    let error = repo
+        .persist_decoded_logs(&source, &logs)
+        .expect_err("negative balance should fail");
+    assert!(
+        format!("{error:#}").contains("would become negative"),
+        "unexpected error: {error:#}"
+    );
+
+    let path = repo
+        .token_path(ctx.chain_id, &ctx.contract, "999", 10)
+        .expect("load token path")
+        .expect("source exists");
+    assert!(path.is_empty());
+}
+
 async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -388,7 +454,18 @@ fn seed_ledger(pool: PgPool, chain_id: i64, contract: &str) {
         )
         .expect("insert test source");
 
-    let logs = vec![
+    let logs = seeded_logs(contract);
+    LedgerRepository::new(repositories.pool().clone())
+        .persist_decoded_logs(&source, &logs)
+        .expect("persist decoded test logs");
+    repositories
+        .ledger()
+        .advance_checkpoint(source.id, 102, &format!("0x{}", "bb".repeat(32)), 110)
+        .expect("insert test checkpoint");
+}
+
+fn seeded_logs(contract: &str) -> Vec<(RpcLog, DecodedLog)> {
+    vec![
         transfer_log(
             contract,
             100,
@@ -400,14 +477,7 @@ fn seed_ledger(pool: PgPool, chain_id: i64, contract: &str) {
         ),
         transfer_log(contract, 101, "02", 0, &address("11"), &address("22"), "42"),
         transfer_log(contract, 102, "03", 0, &zero_address(), &address("33"), "7"),
-    ];
-    LedgerRepository::new(repositories.pool().clone())
-        .persist_decoded_logs(&source, &logs)
-        .expect("persist decoded test logs");
-    repositories
-        .ledger()
-        .advance_checkpoint(source.id, 102, &format!("0x{}", "bb".repeat(32)), 110)
-        .expect("insert test checkpoint");
+    ]
 }
 
 fn transfer_log(

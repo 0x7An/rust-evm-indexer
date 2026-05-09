@@ -247,12 +247,25 @@ impl LedgerRepository {
                 events_persisted += 1;
 
                 for entry in &decoded.entries {
-                    self.upsert_ledger_entry(conn, source, log, event_id, entry)?;
+                    let previous =
+                        self.lock_existing_ledger_entry(conn, source, log, entry.batch_index)?;
+                    if previous
+                        .as_ref()
+                        .is_some_and(|row| row.source_id != source.id)
+                    {
+                        anyhow::bail!(
+                            "existing ledger entry for transaction {} log {} batch {} belongs to another source",
+                            log.transaction_hash,
+                            log.log_index,
+                            entry.batch_index
+                        );
+                    }
+                    let current = self.upsert_ledger_entry(conn, source, log, event_id, entry)?;
+                    self.apply_balance_delta(conn, source, previous.as_ref(), &current)?;
                     ledger_entries_persisted += 1;
                 }
             }
 
-            self.rebuild_balances(conn, source)?;
             let holder_count = self.holder_count_conn(conn, source.id)?;
             let minter_count = self.minter_count_conn(conn, source.id)?;
             let top_holders = self.top_holders_conn(conn, source.id, 10)?;
@@ -829,6 +842,24 @@ impl LedgerRepository {
         Ok(row.id)
     }
 
+    fn lock_existing_ledger_entry(
+        &self,
+        conn: &mut PgConnection,
+        source: &SourceRow,
+        log: &RpcLog,
+        batch_index: i32,
+    ) -> Result<Option<LedgerEntryRow>> {
+        ledger_entries::table
+            .filter(ledger_entries::chain_id.eq(source.chain_id))
+            .filter(ledger_entries::transaction_hash.eq(log.transaction_hash.to_ascii_lowercase()))
+            .filter(ledger_entries::log_index.eq(parse_hex_u64(&log.log_index)? as i32))
+            .filter(ledger_entries::batch_index.eq(batch_index))
+            .for_update()
+            .first::<LedgerEntryRow>(conn)
+            .optional()
+            .context("lock existing ledger entry")
+    }
+
     fn upsert_ledger_entry(
         &self,
         conn: &mut PgConnection,
@@ -836,7 +867,7 @@ impl LedgerRepository {
         log: &RpcLog,
         event_id: Uuid,
         entry: &crate::infra::evm::decoder::DecodedLedgerEntry,
-    ) -> Result<Uuid> {
+    ) -> Result<LedgerEntryRow> {
         let amount = entry
             .amount
             .parse::<BigDecimal>()
@@ -886,7 +917,7 @@ impl LedgerRepository {
             .get_result::<LedgerEntryRow>(conn)
             .context("upsert ledger entry")?;
 
-        Ok(row.id)
+        Ok(row)
     }
 
     fn upsert_transaction_receipt(
@@ -952,45 +983,86 @@ impl LedgerRepository {
         Ok(row.id)
     }
 
-    fn rebuild_balances(&self, conn: &mut PgConnection, source: &SourceRow) -> Result<()> {
-        let rows = ledger_entries::table
-            .filter(ledger_entries::source_id.eq(source.id))
-            .filter(ledger_entries::orphaned.eq(false))
-            .order((
-                ledger_entries::block_number.asc(),
-                ledger_entries::log_index.asc(),
-                ledger_entries::batch_index.asc(),
-            ))
-            .load::<LedgerEntryRow>(conn)
-            .context("load ledger entries for balance rebuild")?;
-
-        diesel::delete(token_balances::table.filter(token_balances::source_id.eq(source.id)))
-            .execute(conn)
-            .context("delete previous token balances")?;
-
-        let mut balances: HashMap<(String, String), BalanceAccumulator> = HashMap::new();
-
-        for row in rows {
-            if let Some(from) = row.from_address {
-                let key = (from, row.token_id.clone());
-                let entry = balances.entry(key).or_default();
-                entry.balance -= row.amount.clone();
-                entry.last_moved_block = Some(row.block_number);
-            }
-
-            if let Some(to) = row.to_address {
-                let key = (to, row.token_id.clone());
-                let entry = balances.entry(key).or_default();
-                entry.balance += row.amount.clone();
-                entry.first_received_block.get_or_insert(row.block_number);
-                entry.last_moved_block = Some(row.block_number);
-            }
+    fn apply_balance_delta(
+        &self,
+        conn: &mut PgConnection,
+        source: &SourceRow,
+        previous: Option<&LedgerEntryRow>,
+        current: &LedgerEntryRow,
+    ) -> Result<()> {
+        let mut deltas = HashMap::<(String, String), BalanceDelta>::new();
+        if let Some(previous) = previous
+            && !previous.orphaned
+        {
+            collect_balance_delta(&mut deltas, previous, true);
+        }
+        if !current.orphaned {
+            collect_balance_delta(&mut deltas, current, false);
         }
 
-        let rows = balances
-            .into_iter()
-            .filter(|(_, value)| value.balance > BigDecimal::zero())
-            .map(|((holder_address, token_id), value)| NewTokenBalanceRow {
+        for ((holder_address, token_id), delta) in deltas {
+            self.apply_holder_balance_delta(conn, source, holder_address, token_id, delta)?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_holder_balance_delta(
+        &self,
+        conn: &mut PgConnection,
+        source: &SourceRow,
+        holder_address: String,
+        token_id: String,
+        delta: BalanceDelta,
+    ) -> Result<()> {
+        let existing = token_balances::table
+            .filter(token_balances::source_id.eq(source.id))
+            .filter(token_balances::holder_address.eq(&holder_address))
+            .filter(token_balances::token_id.eq(&token_id))
+            .for_update()
+            .first::<TokenBalanceRow>(conn)
+            .optional()
+            .context("lock token balance")?;
+
+        let current_balance = existing
+            .as_ref()
+            .map(|row| row.balance.clone())
+            .unwrap_or_else(BigDecimal::zero);
+        let next_balance = current_balance + delta.balance_delta;
+        if next_balance < BigDecimal::zero() {
+            anyhow::bail!(
+                "balance for holder {holder_address} token_id={token_id} would become negative"
+            );
+        }
+
+        let first_received_block = min_optional_block(
+            existing.as_ref().and_then(|row| row.first_received_block),
+            delta.first_received_block,
+        );
+        let last_moved_block = max_optional_block(
+            existing.as_ref().and_then(|row| row.last_moved_block),
+            delta.last_moved_block,
+        );
+
+        if let Some(existing) = existing {
+            diesel::update(token_balances::table.filter(token_balances::id.eq(existing.id)))
+                .set((
+                    token_balances::balance.eq(next_balance),
+                    token_balances::first_received_block.eq(first_received_block),
+                    token_balances::last_moved_block.eq(last_moved_block),
+                    token_balances::updated_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .context("update token balance")?;
+            return Ok(());
+        }
+
+        if next_balance.is_zero() {
+            return Ok(());
+        }
+
+        diesel::insert_into(token_balances::table)
+            .values(NewTokenBalanceRow {
                 id: Uuid::new_v4(),
                 source_id: source.id,
                 chain_id: source.chain_id,
@@ -998,18 +1070,12 @@ impl LedgerRepository {
                 token_standard: source.token_standard.clone(),
                 holder_address,
                 token_id,
-                balance: value.balance,
-                first_received_block: value.first_received_block,
-                last_moved_block: value.last_moved_block,
+                balance: next_balance,
+                first_received_block,
+                last_moved_block,
             })
-            .collect::<Vec<_>>();
-
-        for chunk in rows.chunks(TOKEN_BALANCE_INSERT_CHUNK_SIZE) {
-            diesel::insert_into(token_balances::table)
-                .values(chunk)
-                .execute(conn)
-                .context("insert rebuilt token balances")?;
-        }
+            .execute(conn)
+            .context("insert token balance")?;
 
         Ok(())
     }
@@ -1184,16 +1250,16 @@ impl LedgerRepository {
 }
 
 #[derive(Debug, Clone)]
-struct BalanceAccumulator {
-    balance: BigDecimal,
+struct BalanceDelta {
+    balance_delta: BigDecimal,
     first_received_block: Option<i64>,
     last_moved_block: Option<i64>,
 }
 
-impl Default for BalanceAccumulator {
+impl Default for BalanceDelta {
     fn default() -> Self {
         Self {
-            balance: BigDecimal::zero(),
+            balance_delta: BigDecimal::zero(),
             first_received_block: None,
             last_moved_block: None,
         }
@@ -1207,6 +1273,60 @@ struct MinterAccumulator {
     first_mint_timestamp: Option<DateTime<Utc>>,
     last_mint_block: i64,
     last_mint_timestamp: Option<DateTime<Utc>>,
+}
+
+fn collect_balance_delta(
+    deltas: &mut HashMap<(String, String), BalanceDelta>,
+    row: &LedgerEntryRow,
+    reverse: bool,
+) {
+    let amount = if reverse {
+        -row.amount.clone()
+    } else {
+        row.amount.clone()
+    };
+
+    if let Some(from) = &row.from_address {
+        let delta = deltas
+            .entry((from.clone(), row.token_id.clone()))
+            .or_default();
+        delta.balance_delta -= amount.clone();
+        if !reverse {
+            delta.last_moved_block =
+                max_optional_block(delta.last_moved_block, Some(row.block_number));
+        }
+    }
+
+    if let Some(to) = &row.to_address {
+        let delta = deltas
+            .entry((to.clone(), row.token_id.clone()))
+            .or_default();
+        delta.balance_delta += amount;
+        if !reverse {
+            delta.first_received_block =
+                min_optional_block(delta.first_received_block, Some(row.block_number));
+            delta.last_moved_block =
+                max_optional_block(delta.last_moved_block, Some(row.block_number));
+        }
+    }
+}
+
+fn min_optional_block(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.min(candidate)),
+        (Some(current), None) => Some(current),
+        (None, Some(candidate)) => Some(candidate),
+        (None, None) => None,
+    }
+}
+
+fn max_optional_block(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+        (Some(current), None) => Some(current),
+        (None, Some(candidate)) => Some(candidate),
+        (None, None) => None,
+    }
 }
 
 impl From<TokenBalanceRow> for HolderBalance {
@@ -1306,5 +1426,3 @@ fn normalized_topics(log: &RpcLog) -> serde_json::Value {
             .collect::<Vec<_>>()
     )
 }
-
-const TOKEN_BALANCE_INSERT_CHUNK_SIZE: usize = 1_000;
