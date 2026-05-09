@@ -10,7 +10,7 @@ use crate::infra::{
         rpc::{EvmRpcClient, RpcTransactionReceipt},
     },
     postgres::{
-        ledger_repository::{LedgerRepository, ScanSummary},
+        ledger_repository::{LedgerRepository, PersistDecodedLogsOptions, ScanSummary},
         models::SourceRow,
     },
 };
@@ -26,6 +26,7 @@ pub struct ResolvedRange {
 pub struct IngestOptions {
     pub include_transaction_receipts: bool,
     pub progress: bool,
+    pub restore_orphaned_conflicts: bool,
 }
 
 pub async fn resolve_finalized_range(
@@ -124,7 +125,13 @@ pub async fn ingest_source_range(
     }
 
     let mut summary = ledger
-        .persist_decoded_logs(source, &decoded)
+        .persist_decoded_logs_with_options(
+            source,
+            &decoded,
+            PersistDecodedLogsOptions {
+                restore_orphaned_conflicts: options.restore_orphaned_conflicts,
+            },
+        )
         .context("persist ledger")?;
 
     if options.include_transaction_receipts {

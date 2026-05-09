@@ -139,6 +139,34 @@ fn backfill_resumes_after_checkpoint() {
 }
 
 #[test]
+fn checkpoint_rejects_equal_block_hash_changes() {
+    let ctx = setup();
+    let source = seed_source(&ctx);
+    let original_hash = format!("0x{}", "44".repeat(32));
+    ctx.repositories
+        .ledger()
+        .advance_checkpoint(source.id, 103, &original_hash, 109)
+        .expect("seed checkpoint");
+
+    let err = ctx
+        .repositories
+        .ledger()
+        .advance_checkpoint(source.id, 103, &format!("0x{}", "55".repeat(32)), 110)
+        .expect_err("equal-height hash changes should be rejected");
+    assert!(err.to_string().contains("checkpoint hash mismatch"));
+
+    let checkpoint = ctx
+        .repositories
+        .ledger()
+        .checkpoint_for_source(source.id)
+        .expect("load checkpoint")
+        .expect("checkpoint exists");
+    assert_eq!(checkpoint.processed_block, 103);
+    assert_eq!(checkpoint.processed_block_hash, original_hash);
+    assert_eq!(checkpoint.finalized_block, 109);
+}
+
+#[test]
 fn checkpoint_target_waits_for_contiguous_ranges() {
     let ctx = setup();
     let source = seed_source(&ctx);

@@ -773,6 +773,7 @@ async fn scan_contract(args: ScanContractArgs) -> Result<()> {
         IngestOptions {
             include_transaction_receipts,
             progress: true,
+            restore_orphaned_conflicts: false,
         },
     )
     .await?;

@@ -114,6 +114,11 @@ pub struct OrphanRangeSummary {
     pub ledger_entries_orphaned: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistDecodedLogsOptions {
+    pub restore_orphaned_conflicts: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexedBlockHash {
     pub block_number: i64,
@@ -267,13 +272,22 @@ impl LedgerRepository {
         source: &SourceRow,
         logs: &[(RpcLog, DecodedLog)],
     ) -> Result<ScanSummary> {
+        self.persist_decoded_logs_with_options(source, logs, PersistDecodedLogsOptions::default())
+    }
+
+    pub fn persist_decoded_logs_with_options(
+        &self,
+        source: &SourceRow,
+        logs: &[(RpcLog, DecodedLog)],
+        options: PersistDecodedLogsOptions,
+    ) -> Result<ScanSummary> {
         let mut conn = self.connection()?;
         conn.transaction::<ScanSummary, anyhow::Error, _>(|conn| {
             let mut events_persisted = 0;
             let mut ledger_entries_persisted = 0;
 
             for (log, decoded) in logs {
-                let event_id = self.upsert_event(conn, source, log, decoded)?;
+                let event_id = self.upsert_event(conn, source, log, decoded, options)?;
                 events_persisted += 1;
 
                 for entry in &decoded.entries {
@@ -290,7 +304,8 @@ impl LedgerRepository {
                             entry.batch_index
                         );
                     }
-                    let current = self.upsert_ledger_entry(conn, source, log, event_id, entry)?;
+                    let current =
+                        self.upsert_ledger_entry(conn, source, log, event_id, entry, options)?;
                     self.apply_balance_delta(conn, source, previous.as_ref(), &current)?;
                     ledger_entries_persisted += 1;
                 }
@@ -625,6 +640,17 @@ impl LedgerRepository {
                     .context("insert checkpoint");
             };
 
+            let processed_block_hash = processed_block_hash.to_ascii_lowercase();
+            if processed_block == existing.processed_block
+                && processed_block_hash != existing.processed_block_hash
+            {
+                anyhow::bail!(
+                    "checkpoint hash mismatch at processed block {processed_block}: stored {}, new {}",
+                    existing.processed_block_hash,
+                    processed_block_hash
+                );
+            }
+
             if processed_block < existing.processed_block
                 && finalized_block <= existing.finalized_block
             {
@@ -633,8 +659,8 @@ impl LedgerRepository {
 
             let next_processed_block = existing.processed_block.max(processed_block);
             let next_finalized_block = existing.finalized_block.max(finalized_block);
-            let next_processed_block_hash = if processed_block >= existing.processed_block {
-                processed_block_hash.to_ascii_lowercase()
+            let next_processed_block_hash = if processed_block > existing.processed_block {
+                processed_block_hash
             } else {
                 existing.processed_block_hash
             };
@@ -940,58 +966,85 @@ impl LedgerRepository {
         source: &SourceRow,
         log: &RpcLog,
         decoded: &DecodedLog,
+        options: PersistDecodedLogsOptions,
     ) -> Result<Uuid> {
-        let row = diesel::insert_into(events::table)
-            .values(NewEventRow {
-                id: Uuid::new_v4(),
-                source_id: source.id,
-                chain_id: source.chain_id,
-                block_number: parse_hex_u64(&log.block_number)? as i64,
-                block_timestamp: log.block_timestamp.to_owned(),
-                block_hash: log.block_hash.to_ascii_lowercase(),
-                transaction_hash: log.transaction_hash.to_ascii_lowercase(),
-                transaction_index: parse_optional_hex_i32(log.transaction_index.as_deref())?,
-                log_index: parse_hex_u64(&log.log_index)? as i32,
-                contract_address: log.address.to_ascii_lowercase(),
-                event_name: decoded.event_name.clone(),
-                topics: normalized_topics(log),
-                data: log.data.to_ascii_lowercase(),
-                args: json!({
-                    "entries": decoded.entries.iter().map(|entry| {
-                        json!({
-                            "event_name": entry.event_name,
-                            "token_standard": entry.token_standard.as_str(),
-                            "operator": entry.operator,
-                            "from": entry.from,
-                            "to": entry.to,
-                            "token_id": entry.token_id,
-                            "amount": entry.amount,
-                            "batch_index": entry.batch_index,
-                        })
-                    }).collect::<Vec<_>>()
-                }),
-                finalized: true,
-                orphaned: false,
-            })
-            .on_conflict((
-                events::chain_id,
-                events::transaction_hash,
-                events::log_index,
-            ))
-            .do_update()
-            .set((
-                events::block_timestamp.eq(excluded(events::block_timestamp)),
-                events::block_hash.eq(excluded(events::block_hash)),
-                events::transaction_index.eq(excluded(events::transaction_index)),
-                events::contract_address.eq(excluded(events::contract_address)),
-                events::event_name.eq(excluded(events::event_name)),
-                events::topics.eq(excluded(events::topics)),
-                events::data.eq(excluded(events::data)),
-                events::args.eq(excluded(events::args)),
-                events::finalized.eq(true),
-            ))
-            .get_result::<super::models::EventRow>(conn)
-            .context("upsert event")?;
+        let values = NewEventRow {
+            id: Uuid::new_v4(),
+            source_id: source.id,
+            chain_id: source.chain_id,
+            block_number: parse_hex_u64(&log.block_number)? as i64,
+            block_timestamp: log.block_timestamp.to_owned(),
+            block_hash: log.block_hash.to_ascii_lowercase(),
+            transaction_hash: log.transaction_hash.to_ascii_lowercase(),
+            transaction_index: parse_optional_hex_i32(log.transaction_index.as_deref())?,
+            log_index: parse_hex_u64(&log.log_index)? as i32,
+            contract_address: log.address.to_ascii_lowercase(),
+            event_name: decoded.event_name.clone(),
+            topics: normalized_topics(log),
+            data: log.data.to_ascii_lowercase(),
+            args: json!({
+                "entries": decoded.entries.iter().map(|entry| {
+                    json!({
+                        "event_name": entry.event_name,
+                        "token_standard": entry.token_standard.as_str(),
+                        "operator": entry.operator,
+                        "from": entry.from,
+                        "to": entry.to,
+                        "token_id": entry.token_id,
+                        "amount": entry.amount,
+                        "batch_index": entry.batch_index,
+                    })
+                }).collect::<Vec<_>>()
+            }),
+            finalized: true,
+            orphaned: false,
+        };
+
+        let row = if options.restore_orphaned_conflicts {
+            diesel::insert_into(events::table)
+                .values(values)
+                .on_conflict((
+                    events::chain_id,
+                    events::transaction_hash,
+                    events::log_index,
+                ))
+                .do_update()
+                .set((
+                    events::block_timestamp.eq(excluded(events::block_timestamp)),
+                    events::block_hash.eq(excluded(events::block_hash)),
+                    events::transaction_index.eq(excluded(events::transaction_index)),
+                    events::contract_address.eq(excluded(events::contract_address)),
+                    events::event_name.eq(excluded(events::event_name)),
+                    events::topics.eq(excluded(events::topics)),
+                    events::data.eq(excluded(events::data)),
+                    events::args.eq(excluded(events::args)),
+                    events::finalized.eq(true),
+                    events::orphaned.eq(false),
+                ))
+                .get_result::<super::models::EventRow>(conn)
+        } else {
+            diesel::insert_into(events::table)
+                .values(values)
+                .on_conflict((
+                    events::chain_id,
+                    events::transaction_hash,
+                    events::log_index,
+                ))
+                .do_update()
+                .set((
+                    events::block_timestamp.eq(excluded(events::block_timestamp)),
+                    events::block_hash.eq(excluded(events::block_hash)),
+                    events::transaction_index.eq(excluded(events::transaction_index)),
+                    events::contract_address.eq(excluded(events::contract_address)),
+                    events::event_name.eq(excluded(events::event_name)),
+                    events::topics.eq(excluded(events::topics)),
+                    events::data.eq(excluded(events::data)),
+                    events::args.eq(excluded(events::args)),
+                    events::finalized.eq(true),
+                ))
+                .get_result::<super::models::EventRow>(conn)
+        }
+        .context("upsert event")?;
 
         Ok(row.id)
     }
@@ -1021,6 +1074,7 @@ impl LedgerRepository {
         log: &RpcLog,
         event_id: Uuid,
         entry: &crate::infra::evm::decoder::DecodedLedgerEntry,
+        options: PersistDecodedLogsOptions,
     ) -> Result<LedgerEntryRow> {
         let amount = entry
             .amount
@@ -1028,47 +1082,71 @@ impl LedgerRepository {
             .with_context(|| format!("parse amount {}", entry.amount))?;
         let movement_type = movement_type(&entry.from, &entry.to);
 
-        let row = diesel::insert_into(ledger_entries::table)
-            .values(NewLedgerEntryRow {
-                id: Uuid::new_v4(),
-                event_id,
-                source_id: source.id,
-                chain_id: source.chain_id,
-                contract_address: log.address.to_ascii_lowercase(),
-                token_standard: entry.token_standard.as_str().to_string(),
-                movement_type: movement_type.to_string(),
-                operator_address: entry
-                    .operator
-                    .as_ref()
-                    .map(|value| value.to_ascii_lowercase()),
-                from_address: non_zero_address(&entry.from),
-                to_address: non_zero_address(&entry.to),
-                token_id: entry.token_id.clone(),
-                amount,
-                batch_index: entry.batch_index,
-                block_number: parse_hex_u64(&log.block_number)? as i64,
-                block_timestamp: log.block_timestamp.to_owned(),
-                block_hash: log.block_hash.to_ascii_lowercase(),
-                transaction_hash: log.transaction_hash.to_ascii_lowercase(),
-                transaction_index: parse_optional_hex_i32(log.transaction_index.as_deref())?,
-                log_index: parse_hex_u64(&log.log_index)? as i32,
-                orphaned: false,
-            })
-            .on_conflict((
-                ledger_entries::chain_id,
-                ledger_entries::transaction_hash,
-                ledger_entries::log_index,
-                ledger_entries::batch_index,
-            ))
-            .do_update()
-            .set((
-                ledger_entries::amount.eq(excluded(ledger_entries::amount)),
-                ledger_entries::block_timestamp.eq(excluded(ledger_entries::block_timestamp)),
-                ledger_entries::block_hash.eq(excluded(ledger_entries::block_hash)),
-                ledger_entries::transaction_index.eq(excluded(ledger_entries::transaction_index)),
-            ))
-            .get_result::<LedgerEntryRow>(conn)
-            .context("upsert ledger entry")?;
+        let values = NewLedgerEntryRow {
+            id: Uuid::new_v4(),
+            event_id,
+            source_id: source.id,
+            chain_id: source.chain_id,
+            contract_address: log.address.to_ascii_lowercase(),
+            token_standard: entry.token_standard.as_str().to_string(),
+            movement_type: movement_type.to_string(),
+            operator_address: entry
+                .operator
+                .as_ref()
+                .map(|value| value.to_ascii_lowercase()),
+            from_address: non_zero_address(&entry.from),
+            to_address: non_zero_address(&entry.to),
+            token_id: entry.token_id.clone(),
+            amount,
+            batch_index: entry.batch_index,
+            block_number: parse_hex_u64(&log.block_number)? as i64,
+            block_timestamp: log.block_timestamp.to_owned(),
+            block_hash: log.block_hash.to_ascii_lowercase(),
+            transaction_hash: log.transaction_hash.to_ascii_lowercase(),
+            transaction_index: parse_optional_hex_i32(log.transaction_index.as_deref())?,
+            log_index: parse_hex_u64(&log.log_index)? as i32,
+            orphaned: false,
+        };
+
+        let row = if options.restore_orphaned_conflicts {
+            diesel::insert_into(ledger_entries::table)
+                .values(values)
+                .on_conflict((
+                    ledger_entries::chain_id,
+                    ledger_entries::transaction_hash,
+                    ledger_entries::log_index,
+                    ledger_entries::batch_index,
+                ))
+                .do_update()
+                .set((
+                    ledger_entries::amount.eq(excluded(ledger_entries::amount)),
+                    ledger_entries::block_timestamp.eq(excluded(ledger_entries::block_timestamp)),
+                    ledger_entries::block_hash.eq(excluded(ledger_entries::block_hash)),
+                    ledger_entries::transaction_index
+                        .eq(excluded(ledger_entries::transaction_index)),
+                    ledger_entries::orphaned.eq(false),
+                ))
+                .get_result::<LedgerEntryRow>(conn)
+        } else {
+            diesel::insert_into(ledger_entries::table)
+                .values(values)
+                .on_conflict((
+                    ledger_entries::chain_id,
+                    ledger_entries::transaction_hash,
+                    ledger_entries::log_index,
+                    ledger_entries::batch_index,
+                ))
+                .do_update()
+                .set((
+                    ledger_entries::amount.eq(excluded(ledger_entries::amount)),
+                    ledger_entries::block_timestamp.eq(excluded(ledger_entries::block_timestamp)),
+                    ledger_entries::block_hash.eq(excluded(ledger_entries::block_hash)),
+                    ledger_entries::transaction_index
+                        .eq(excluded(ledger_entries::transaction_index)),
+                ))
+                .get_result::<LedgerEntryRow>(conn)
+        }
+        .context("upsert ledger entry")?;
 
         Ok(row)
     }

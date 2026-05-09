@@ -478,6 +478,108 @@ async fn worker_replays_range_by_orphaning_existing_rows_and_ingesting_canonical
 }
 
 #[tokio::test]
+async fn worker_replay_reactivates_identical_canonical_log() {
+    let ctx = setup();
+    let rpc_url = start_fake_rpc(ctx.contract.clone()).await;
+    ctx.repositories
+        .ledger()
+        .ensure_chain(
+            &format!("worker-replay-same-log-test-chain-{}", ctx.chain_id),
+            ctx.chain_id,
+            "<test>",
+            12,
+        )
+        .expect("ensure chain");
+    let source = ctx
+        .repositories
+        .ledger()
+        .ensure_source(
+            ctx.chain_id,
+            "worker-replay-same-log-test-source",
+            &ctx.contract,
+            TokenStandard::Erc721,
+            100,
+        )
+        .expect("ensure source");
+    let canonical_tx_hash = format!("0x{:064x}", 100);
+    ctx.repositories
+        .ledger()
+        .persist_decoded_logs(
+            &source,
+            &[decoded_transfer_log_with_tx_and_holder(
+                &ctx.contract,
+                100,
+                &canonical_tx_hash,
+                "11",
+            )],
+        )
+        .expect("persist canonical decoded log");
+
+    ctx.repositories
+        .jobs()
+        .enqueue(
+            NewJob::new(
+                JobType::ReplayRange,
+                ctx.chain_id,
+                format!("it:worker-replay-same-log:{}:100:100", source.id),
+            )
+            .with_source(source.id)
+            .with_range(100, 100),
+        )
+        .expect("enqueue replay job");
+
+    let worker = IngestWorker::new(
+        ctx.repositories.clone(),
+        EvmRpcClient::new(rpc_url),
+        "worker-replay-same-log-it",
+        Duration::seconds(60),
+        10,
+    )
+    .with_chain_id(ctx.chain_id);
+    let outcome = worker.run_once().await.expect("run replay worker once");
+
+    let WorkerOutcome::Processed { summary, .. } = outcome else {
+        panic!("worker should process replay job, got {outcome:?}");
+    };
+    assert_eq!(summary.events_seen, 1);
+    assert_eq!(summary.holder_count, 1);
+
+    let mut conn = ctx.pool.get().expect("get postgres connection");
+    let active_ledger_entries = ledger_entries::table
+        .filter(ledger_entries::source_id.eq(source.id))
+        .filter(ledger_entries::orphaned.eq(false))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .expect("count active ledger entries");
+    let orphaned_ledger_entries = ledger_entries::table
+        .filter(ledger_entries::source_id.eq(source.id))
+        .filter(ledger_entries::orphaned.eq(true))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .expect("count orphaned ledger entries");
+    assert_eq!(active_ledger_entries, 1);
+    assert_eq!(orphaned_ledger_entries, 0);
+
+    let event_orphaned = events::table
+        .filter(events::source_id.eq(source.id))
+        .filter(events::transaction_hash.eq(canonical_tx_hash))
+        .select(events::orphaned)
+        .first::<bool>(&mut conn)
+        .expect("load replayed event");
+    assert!(!event_orphaned);
+
+    let holders = ctx
+        .repositories
+        .ledger()
+        .holders(ctx.chain_id, &ctx.contract, 10)
+        .expect("load holders")
+        .expect("holders exist");
+    assert_eq!(holders.len(), 1);
+    assert_eq!(holders[0].holder_address, address("11"));
+    assert_eq!(holders[0].balance, "1");
+}
+
+#[tokio::test]
 async fn worker_rejects_range_when_contract_code_is_missing_at_from_boundary() {
     let ctx = setup();
     let rpc_url = start_fake_rpc_with_missing_code(ctx.contract.clone(), 100).await;
@@ -678,13 +780,27 @@ fn erc721_transfer_log(contract: &str, block_number: u64) -> Value {
 }
 
 fn decoded_transfer_log(contract: &str, block_number: u64) -> (RpcLog, DecodedLog) {
+    decoded_transfer_log_with_tx_and_holder(
+        contract,
+        block_number,
+        &format!("0x{}", "aa".repeat(32)),
+        "22",
+    )
+}
+
+fn decoded_transfer_log_with_tx_and_holder(
+    contract: &str,
+    block_number: u64,
+    transaction_hash: &str,
+    holder_byte: &str,
+) -> (RpcLog, DecodedLog) {
     (
         RpcLog {
             address: contract.to_string(),
             topics: Vec::new(),
             data: "0x".to_string(),
             block_number: format!("0x{block_number:x}"),
-            transaction_hash: format!("0x{}", "aa".repeat(32)),
+            transaction_hash: transaction_hash.to_string(),
             transaction_index: Some("0x0".to_string()),
             log_index: "0x0".to_string(),
             block_hash: format!("0x{}", "bb".repeat(32)),
@@ -697,7 +813,7 @@ fn decoded_transfer_log(contract: &str, block_number: u64) -> (RpcLog, DecodedLo
                 token_standard: TokenStandard::Erc721,
                 operator: None,
                 from: address("00"),
-                to: address("22"),
+                to: address(holder_byte),
                 token_id: "42".to_string(),
                 amount: "1".to_string(),
                 batch_index: 0,
