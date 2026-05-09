@@ -335,7 +335,7 @@ enum WorkerCommands {
         chain_id: Option<i64>,
 
         /// Lease duration for the job.
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 60)]
         lease_seconds: i64,
 
         /// Maximum block span per eth_getLogs call.
@@ -366,7 +366,7 @@ enum WorkerCommands {
         chain_id: Option<i64>,
 
         /// Lease duration for each job.
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 60)]
         lease_seconds: i64,
 
         /// Maximum block span per eth_getLogs call.
@@ -1588,5 +1588,53 @@ fn validate_rpc_url_chain_hint(value: &str, chain_id: Option<i64>) -> Result<()>
             bail!("selected RPC URL looks like Ethereum mainnet, but --chain-id is 137")
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_commands_default_to_sixty_second_leases() {
+        let run_once = Cli::try_parse_from([
+            "indexer",
+            "worker",
+            "run-once",
+            "--database-url",
+            "postgres://indexer:indexer@localhost/indexer_rs",
+        ])
+        .expect("parse worker run-once");
+        let Commands::Worker {
+            command:
+                WorkerCommands::RunOnce {
+                    lease_seconds: run_once_lease,
+                    ..
+                },
+        } = run_once.command
+        else {
+            panic!("expected worker run-once command");
+        };
+        assert_eq!(run_once_lease, 60);
+
+        let run = Cli::try_parse_from([
+            "indexer",
+            "worker",
+            "run",
+            "--database-url",
+            "postgres://indexer:indexer@localhost/indexer_rs",
+        ])
+        .expect("parse worker run");
+        let Commands::Worker {
+            command:
+                WorkerCommands::Run {
+                    lease_seconds: run_lease,
+                    ..
+                },
+        } = run.command
+        else {
+            panic!("expected worker run command");
+        };
+        assert_eq!(run_lease, 60);
     }
 }

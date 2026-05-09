@@ -230,7 +230,7 @@ Then run one worker lease/execution cycle:
 cargo run -- worker run-once \
   --worker-id local-worker \
   --chain-id 137 \
-  --lease-seconds 300 \
+  --lease-seconds 60 \
   --chunk-size 10
 ```
 
@@ -244,7 +244,7 @@ provenance matters for the indexed slice:
 cargo run -- worker run-once \
   --worker-id local-worker \
   --chain-id 137 \
-  --lease-seconds 300 \
+  --lease-seconds 60 \
   --chunk-size 10 \
   --include-transaction-receipts
 ```
@@ -346,7 +346,7 @@ Drain a planned full-history backfill until the queue is empty:
 cargo run -- worker run \
   --worker-id polygon-worker \
   --chain-id 137 \
-  --lease-seconds 300 \
+  --lease-seconds 60 \
   --chunk-size 100 \
   --include-transaction-receipts \
   --stop-when-idle
