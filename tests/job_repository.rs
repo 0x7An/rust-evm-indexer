@@ -286,6 +286,10 @@ fn expired_lease_can_be_reclaimed() {
     assert_eq!(first.id, second.id);
     assert_eq!(second.leased_by.as_deref(), Some("worker-b"));
     assert_eq!(second.attempts, 2);
+
+    let attempts = ctx.repo.attempts_for_job(second.id).expect("load attempts");
+    assert_eq!(attempts[0].status, JobStatus::Cancelled.to_string());
+    assert_eq!(attempts[0].error_class.as_deref(), Some("LeaseExpired"));
 }
 
 #[test]
@@ -339,6 +343,48 @@ fn failed_job_retries_until_dead_lettered() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].status, JobStatus::Failed.to_string());
     assert_eq!(attempts[1].status, JobStatus::DeadLettered.to_string());
+}
+
+#[test]
+fn interrupted_job_is_requeued_and_attempt_is_closed() {
+    let ctx = setup();
+    ctx.repo
+        .enqueue(
+            NewJob::new(JobType::IngestRange, ctx.chain_id, key("interrupted")).with_range(1, 5),
+        )
+        .expect("insert job");
+
+    let leased = ctx
+        .repo
+        .lease_next_for_type_and_chain(
+            "worker-a",
+            Duration::seconds(60),
+            JobType::IngestRange,
+            ctx.chain_id,
+        )
+        .expect("lease query")
+        .expect("leased job");
+    ctx.repo.mark_running(leased.id).expect("mark running");
+
+    let queued = ctx
+        .repo
+        .mark_interrupted_for_retry(leased.id, "shutdown requested")
+        .expect("mark interrupted");
+
+    assert_eq!(queued.status, JobStatus::Queued.to_string());
+    assert!(queued.leased_by.is_none());
+    assert!(queued.lease_expires_at.is_none());
+    assert_eq!(queued.error_class.as_deref(), Some("WorkerInterrupted"));
+    assert_eq!(queued.error_message.as_deref(), Some("shutdown requested"));
+
+    let attempts = ctx.repo.attempts_for_job(leased.id).expect("load attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, JobStatus::Cancelled.to_string());
+    assert!(attempts[0].finished_at.is_some());
+    assert_eq!(
+        attempts[0].error_class.as_deref(),
+        Some("WorkerInterrupted")
+    );
 }
 
 #[test]

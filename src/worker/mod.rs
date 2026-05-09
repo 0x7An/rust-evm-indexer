@@ -1,5 +1,7 @@
 //! Thin job worker adapter for durable ingestion jobs.
 
+use std::future::Future;
+
 use anyhow::{Context, Result, bail};
 use chrono::Duration;
 use uuid::Uuid;
@@ -63,6 +65,43 @@ impl IngestWorker {
     }
 
     pub async fn run_once(&self) -> Result<WorkerOutcome> {
+        let Some(running) = self.lease_and_mark_running()? else {
+            return Ok(WorkerOutcome::NoJob);
+        };
+
+        let result = self.execute_job(&running).await;
+        self.finish_running_job(&running, result)
+    }
+
+    pub async fn run_once_until_shutdown(
+        &self,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<WorkerOutcome> {
+        let Some(running) = self.lease_and_mark_running()? else {
+            return Ok(WorkerOutcome::NoJob);
+        };
+
+        tokio::pin!(shutdown);
+        tokio::select! {
+            result = self.execute_job(&running) => self.finish_running_job(&running, result),
+            _ = &mut shutdown => {
+                let interrupted = self
+                    .repositories
+                    .jobs()
+                    .mark_interrupted_for_retry(
+                        running.id,
+                        "worker shutdown requested before job completed",
+                    )
+                    .context("release interrupted job")?;
+                Ok(WorkerOutcome::Interrupted {
+                    job_id: interrupted.id,
+                    status: interrupted.status,
+                })
+            }
+        }
+    }
+
+    fn lease_and_mark_running(&self) -> Result<Option<JobRow>> {
         if self.chunk_size == 0 {
             bail!("chunk-size must be greater than zero");
         }
@@ -83,7 +122,7 @@ impl IngestWorker {
         .context("lease next job")?;
 
         let Some(leased) = leased else {
-            return Ok(WorkerOutcome::NoJob);
+            return Ok(None);
         };
 
         let running = self
@@ -92,7 +131,15 @@ impl IngestWorker {
             .mark_running(leased.id)
             .context("mark job running")?;
 
-        match self.execute_job(&running).await {
+        Ok(Some(running))
+    }
+
+    fn finish_running_job(
+        &self,
+        running: &JobRow,
+        result: Result<ScanSummary>,
+    ) -> Result<WorkerOutcome> {
+        match result {
             Ok(summary) => {
                 let succeeded = self
                     .repositories
@@ -139,6 +186,11 @@ impl IngestWorker {
                 }
                 WorkerOutcome::Failed { .. } => {
                     summary.failed_jobs += 1;
+                }
+                WorkerOutcome::Interrupted { .. } => {
+                    summary.interrupted_jobs += 1;
+                    summary.stop_reason = WorkerRunStopReason::Interrupted;
+                    return Ok(summary);
                 }
             }
         }
@@ -222,12 +274,13 @@ fn format_error_chain(error: &anyhow::Error) -> String {
 pub struct WorkerRunSummary {
     pub processed_jobs: usize,
     pub failed_jobs: usize,
+    pub interrupted_jobs: usize,
     pub stop_reason: WorkerRunStopReason,
 }
 
 impl WorkerRunSummary {
     pub fn attempted_jobs(&self) -> usize {
-        self.processed_jobs + self.failed_jobs
+        self.processed_jobs + self.failed_jobs + self.interrupted_jobs
     }
 }
 
@@ -236,6 +289,7 @@ impl Default for WorkerRunSummary {
         Self {
             processed_jobs: 0,
             failed_jobs: 0,
+            interrupted_jobs: 0,
             stop_reason: WorkerRunStopReason::Idle,
         }
     }
@@ -245,6 +299,7 @@ impl Default for WorkerRunSummary {
 pub enum WorkerRunStopReason {
     Idle,
     MaxJobsReached,
+    Interrupted,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +313,10 @@ pub enum WorkerOutcome {
         job_id: Uuid,
         status: String,
         error: String,
+    },
+    Interrupted {
+        job_id: Uuid,
+        status: String,
     },
 }
 

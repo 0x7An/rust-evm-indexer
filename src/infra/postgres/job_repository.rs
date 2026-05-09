@@ -163,6 +163,22 @@ impl JobRepository {
             };
 
             let now = Utc::now();
+            if matches!(candidate.status.as_str(), "leased" | "running")
+                && candidate
+                    .lease_expires_at
+                    .as_ref()
+                    .is_some_and(|expires_at| *expires_at < now)
+            {
+                self.update_attempt_status(
+                    conn,
+                    candidate.id,
+                    candidate.attempts,
+                    JobStatus::Cancelled,
+                    Some("LeaseExpired".to_string()),
+                    Some("job lease expired before worker completed".to_string()),
+                )?;
+            }
+
             let leased = diesel::update(jobs::table.filter(jobs::id.eq(candidate.id)))
                 .set((
                     jobs::status.eq(JobStatus::Leased.to_string()),
@@ -186,6 +202,47 @@ impl JobRepository {
                 .execute(conn)?;
 
             Ok(Some(leased))
+        })
+    }
+
+    pub fn mark_interrupted_for_retry(
+        &self,
+        job_id: Uuid,
+        error_message: &str,
+    ) -> QueryResult<JobRow> {
+        let mut conn = self.connection()?;
+        conn.transaction(|conn| {
+            let row = jobs::table
+                .filter(jobs::id.eq(job_id))
+                .for_update()
+                .first::<JobRow>(conn)?;
+
+            if !matches!(row.status.as_str(), "leased" | "running") {
+                return Ok(row);
+            }
+
+            let now = Utc::now();
+            let row = diesel::update(jobs::table.filter(jobs::id.eq(row.id)))
+                .set((
+                    jobs::status.eq(JobStatus::Queued.to_string()),
+                    jobs::leased_by.eq::<Option<String>>(None),
+                    jobs::lease_expires_at.eq::<Option<chrono::DateTime<Utc>>>(None),
+                    jobs::error_class.eq(Some("WorkerInterrupted".to_string())),
+                    jobs::error_message.eq(Some(error_message.to_string())),
+                    jobs::updated_at.eq(now),
+                ))
+                .get_result::<JobRow>(conn)?;
+
+            self.update_attempt_status(
+                conn,
+                row.id,
+                row.attempts,
+                JobStatus::Cancelled,
+                Some("WorkerInterrupted".to_string()),
+                Some(error_message.to_string()),
+            )?;
+
+            Ok(row)
         })
     }
 

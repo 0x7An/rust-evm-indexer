@@ -881,7 +881,7 @@ async fn worker_run_once(
         include_transaction_receipts,
     )?;
 
-    let outcome = worker.run_once().await?;
+    let outcome = worker.run_once_until_shutdown(shutdown_signal()).await?;
     print_worker_outcome(&outcome);
     if outcome.is_terminal_failure() {
         if let WorkerOutcome::Failed { job_id, .. } = outcome {
@@ -927,7 +927,7 @@ async fn worker_run(
             return Ok(());
         }
 
-        let outcome = worker.run_once().await?;
+        let outcome = worker.run_once_until_shutdown(shutdown_signal()).await?;
         match &outcome {
             WorkerOutcome::NoJob => {
                 if stop_when_idle {
@@ -940,12 +940,22 @@ async fn worker_run(
                     println!("No queued jobs available. Polling every {idle_sleep_ms}ms.");
                     printed_idle = true;
                 }
-                tokio::time::sleep(StdDuration::from_millis(idle_sleep_ms)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(StdDuration::from_millis(idle_sleep_ms)) => {}
+                    _ = shutdown_signal() => {
+                        println!("Worker shutdown requested while idle.");
+                        return Ok(());
+                    }
+                }
             }
             WorkerOutcome::Processed { .. } | WorkerOutcome::Failed { .. } => {
                 attempted_jobs += 1;
                 printed_idle = false;
                 print_worker_outcome(&outcome);
+            }
+            WorkerOutcome::Interrupted { .. } => {
+                print_worker_outcome(&outcome);
+                return Ok(());
             }
         }
     }
@@ -1002,6 +1012,15 @@ fn print_worker_outcome(outcome: &WorkerOutcome) {
         } => {
             println!("Ingest job {job_id} failed with status {status}: {error}");
         }
+        WorkerOutcome::Interrupted { job_id, status } => {
+            println!("Worker interrupted. Job {job_id} released with status {status}.");
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("Failed to listen for shutdown signal: {error}");
     }
 }
 
