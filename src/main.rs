@@ -206,6 +206,33 @@ enum Commands {
         limit_blocks: i64,
     },
 
+    /// Fetch receipts for indexed ledger transactions that do not have one yet.
+    BackfillTransactionReceipts {
+        /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Postgres database URL. Prefer DATABASE_URL for local use.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+
+        /// EVM chain id for the indexed source.
+        #[arg(long, default_value_t = 1)]
+        chain_id: i64,
+
+        /// Contract address with indexed ledger rows to repair.
+        #[arg(long)]
+        contract: String,
+
+        /// Maximum missing transaction receipts to fetch in one run.
+        #[arg(long, default_value_t = 1_000)]
+        limit: i64,
+
+        /// Number of fetched receipts to persist per database transaction.
+        #[arg(long, default_value_t = 100)]
+        persist_batch_size: usize,
+    },
+
     /// Run the HTTP read API for indexed ledger data.
     Serve {
         /// Postgres database URL. Prefer DATABASE_URL for local use.
@@ -439,6 +466,26 @@ async fn main() -> Result<()> {
             let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
 
             backfill_event_metadata(rpc_url, database_url, chain_id, contract, limit_blocks).await
+        }
+        Commands::BackfillTransactionReceipts {
+            rpc_url,
+            database_url,
+            chain_id,
+            contract,
+            limit,
+            persist_batch_size,
+        } => {
+            let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
+
+            backfill_transaction_receipts(
+                rpc_url,
+                database_url,
+                chain_id,
+                contract,
+                limit,
+                persist_batch_size,
+            )
+            .await
         }
         Commands::Serve { database_url, bind } => serve_api(database_url, bind).await,
         Commands::Worker { command } => match command {
@@ -854,6 +901,90 @@ async fn backfill_event_metadata(
     println!("RPC logs inspected: {rpc_logs_seen}");
     println!("Event rows updated: {events_updated}");
     println!("Ledger rows updated: {ledger_entries_updated}");
+
+    Ok(())
+}
+
+async fn backfill_transaction_receipts(
+    rpc_url: String,
+    database_url: String,
+    chain_id: i64,
+    contract: String,
+    limit: i64,
+    persist_batch_size: usize,
+) -> Result<()> {
+    let contract = normalize_address(&contract)?;
+    if chain_id <= 0 {
+        bail!("chain-id must be greater than zero");
+    }
+    if limit <= 0 {
+        bail!("limit must be greater than zero");
+    }
+    if persist_batch_size == 0 {
+        bail!("persist-batch-size must be greater than zero");
+    }
+
+    let pool = build_pool(&database_url).context("build postgres pool")?;
+    let repositories = PostgresRepositories::new(pool);
+    let source = repositories
+        .ledger()
+        .source_by_contract(chain_id, &contract)
+        .context("load source by contract")?
+        .context("contract source not found")?;
+    let transaction_hashes = repositories
+        .ledger()
+        .transaction_hashes_missing_receipts(source.id, limit)
+        .context("load missing transaction receipt hashes")?;
+
+    if transaction_hashes.is_empty() {
+        println!("No indexed ledger transactions are missing receipts for {contract}.");
+        return Ok(());
+    }
+
+    println!(
+        "Backfilling transaction receipts for {contract} on chain {chain_id}: {} missing transactions selected.",
+        transaction_hashes.len()
+    );
+
+    let rpc = EvmRpcClient::new(&rpc_url);
+    let mut fetched = 0usize;
+    let mut persisted = 0usize;
+    let mut batch = Vec::with_capacity(persist_batch_size.min(transaction_hashes.len()));
+    let total = transaction_hashes.len();
+
+    for transaction_hash in transaction_hashes {
+        batch.push(
+            rpc.transaction_receipt(&transaction_hash)
+                .await
+                .with_context(|| format!("fetch transaction receipt {transaction_hash}"))?,
+        );
+        fetched += 1;
+
+        if fetched == 1 || fetched == total || fetched % 100 == 0 {
+            println!("Fetched transaction receipt {fetched}/{total}.");
+        }
+
+        if batch.len() >= persist_batch_size {
+            persisted += repositories
+                .ledger()
+                .persist_transaction_receipts(chain_id, &batch)
+                .context("persist transaction receipt batch")?;
+            println!("Persisted transaction receipts: {persisted}/{total}.");
+            batch.clear();
+        }
+    }
+
+    if !batch.is_empty() {
+        persisted += repositories
+            .ledger()
+            .persist_transaction_receipts(chain_id, &batch)
+            .context("persist final transaction receipt batch")?;
+        println!("Persisted transaction receipts: {persisted}/{total}.");
+    }
+
+    println!("Transaction receipt backfill complete.");
+    println!("Receipts fetched: {fetched}");
+    println!("Receipts persisted: {persisted}");
 
     Ok(())
 }

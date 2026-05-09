@@ -3,7 +3,12 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
-use diesel::{PgConnection, prelude::*, upsert::excluded};
+use diesel::{
+    PgConnection, QueryableByName,
+    prelude::*,
+    sql_types::{BigInt, Text as SqlText, Uuid as SqlUuid},
+    upsert::excluded,
+};
 use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -98,6 +103,12 @@ pub struct LedgerTransfer {
 pub struct LogMetadataUpdate {
     pub events_updated: usize,
     pub ledger_entries_updated: usize,
+}
+
+#[derive(Debug, QueryableByName)]
+struct MissingReceiptHashRow {
+    #[diesel(sql_type = SqlText)]
+    transaction_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -264,6 +275,32 @@ impl LedgerRepository {
             Ok(persisted)
         })
         .context("persist transaction receipts")
+    }
+
+    pub fn transaction_hashes_missing_receipts(
+        &self,
+        source_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.connection()?;
+        diesel::sql_query(
+            "SELECT le.transaction_hash AS transaction_hash
+             FROM ledger_entries le
+             LEFT JOIN transaction_receipts tr
+               ON tr.chain_id = le.chain_id
+              AND tr.transaction_hash = le.transaction_hash
+             WHERE le.source_id = $1
+               AND le.orphaned = false
+               AND tr.id IS NULL
+             GROUP BY le.transaction_hash
+             ORDER BY MIN(le.block_number), le.transaction_hash
+             LIMIT $2",
+        )
+        .bind::<SqlUuid, _>(source_id)
+        .bind::<BigInt, _>(limit.clamp(1, 10_000))
+        .load::<MissingReceiptHashRow>(&mut conn)
+        .map(|rows| rows.into_iter().map(|row| row.transaction_hash).collect())
+        .context("load transaction hashes missing receipts")
     }
 
     pub fn source_by_contract(

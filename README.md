@@ -97,7 +97,7 @@ Each checkpoint should keep the project buildable, include focused validation, a
 
 ## Current Status
 
-Checkpoint 12 is complete. The project currently contains the public Rust skeleton, pure domain model, Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, cursor-paginated read APIs, event block/log metadata for querying ledger history by real on-chain time, and optional transaction receipt ingestion for transaction sender/status/gas provenance. Repair/replay support and observability will be introduced in later checkpoints.
+Checkpoint 12 is complete. The project currently contains the public Rust skeleton, pure domain model, Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, cursor-paginated read APIs, event block/log metadata for querying ledger history by real on-chain time, optional transaction receipt ingestion for transaction sender/status/gas provenance, and repair commands for metadata or receipt gaps. Replay support and observability will be introduced in later checkpoints.
 
 ## Development
 
@@ -245,6 +245,22 @@ The same flag is available on `scan-contract` and `worker run`. Receipts are
 upserted into `transaction_receipts` by `(chain_id, transaction_hash)` and keep
 the raw receipt JSON alongside normalized fields such as `from_address`,
 `to_address`, `status`, `gas_used`, and `effective_gas_price`.
+
+If ledger rows were indexed before receipt ingestion was enabled, fetch missing
+receipts later without reprocessing decoded events:
+
+```sh
+cargo run -- backfill-transaction-receipts \
+  --chain-id 1 \
+  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
+  --limit 1000 \
+  --persist-batch-size 100
+```
+
+This command selects distinct indexed transaction hashes that do not yet have a
+receipt row, fetches each receipt through the configured chain RPC URL, and
+upserts results idempotently. It is safe to rerun with another `--limit` until
+there are no missing receipts left.
 
 For larger ranges, plan a resumable backfill. This splits the requested finalized range into deterministic `INGEST_RANGE` jobs and skips ranges that are already covered by the source checkpoint:
 

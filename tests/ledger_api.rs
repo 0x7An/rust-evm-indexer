@@ -11,16 +11,21 @@ use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use indexer_rs::{
     api,
     infra::{
-        evm::decoder::{DecodedLedgerEntry, DecodedLog, RpcLog, TokenStandard},
+        evm::{
+            decoder::{DecodedLedgerEntry, DecodedLog, RpcLog, TokenStandard},
+            rpc::RpcTransactionReceipt,
+        },
         postgres::{
             connection::{PgPool, build_pool},
             ledger_repository::LedgerRepository,
             repositories::PostgresRepositories,
-            schema::{chains, events, ledger_entries, sources, token_balances},
+            schema::{
+                chains, events, ledger_entries, sources, token_balances, transaction_receipts,
+            },
         },
     },
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -298,6 +303,49 @@ async fn returns_clear_client_errors() {
     assert_eq!(body["error"], "invalid cursor");
 }
 
+#[tokio::test]
+async fn lists_transaction_hashes_missing_receipts() {
+    let ctx = setup();
+    let repo = LedgerRepository::new(ctx.pool.clone());
+    let source = repo
+        .source_by_contract(ctx.chain_id, &ctx.contract)
+        .expect("load source")
+        .expect("source exists");
+
+    let missing = repo
+        .transaction_hashes_missing_receipts(source.id, 10)
+        .expect("load missing receipt hashes");
+    assert_eq!(
+        missing,
+        vec![
+            format!("0x{}", "01".repeat(32)),
+            format!("0x{}", "02".repeat(32)),
+            format!("0x{}", "03".repeat(32)),
+        ]
+    );
+
+    repo.persist_transaction_receipts(
+        ctx.chain_id,
+        &[receipt(
+            &ctx.contract,
+            &format!("0x{}", "01".repeat(32)),
+            100,
+        )],
+    )
+    .expect("persist receipt");
+
+    let missing = repo
+        .transaction_hashes_missing_receipts(source.id, 10)
+        .expect("load missing receipt hashes");
+    assert_eq!(
+        missing,
+        vec![
+            format!("0x{}", "02".repeat(32)),
+            format!("0x{}", "03".repeat(32)),
+        ]
+    );
+}
+
 async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -399,12 +447,33 @@ fn transfer_log(
     )
 }
 
+fn receipt(contract: &str, tx_hash: &str, block_number: u64) -> RpcTransactionReceipt {
+    RpcTransactionReceipt {
+        transaction_hash: tx_hash.to_string(),
+        transaction_index: "0x2".to_string(),
+        block_hash: format!("0x{}", "aa".repeat(32)),
+        block_number: format!("0x{block_number:x}"),
+        from: address("11"),
+        to: Some(contract.to_string()),
+        contract_address: None,
+        status: Some("0x1".to_string()),
+        gas_used: "0x5208".to_string(),
+        cumulative_gas_used: "0x5208".to_string(),
+        effective_gas_price: Some("0x3b9aca00".to_string()),
+        transaction_type: Some("0x2".to_string()),
+        raw: json!({ "transactionHash": tx_hash }),
+    }
+}
+
 fn block_timestamp(block_number: u64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(1_609_459_200 + block_number as i64, 0)
         .expect("test block timestamp")
 }
 
 fn cleanup_chain(conn: &mut PgConnection, chain_id: i64) {
+    diesel::delete(transaction_receipts::table.filter(transaction_receipts::chain_id.eq(chain_id)))
+        .execute(conn)
+        .expect("delete test transaction receipts");
     diesel::delete(token_balances::table.filter(token_balances::chain_id.eq(chain_id)))
         .execute(conn)
         .expect("delete test balances");
