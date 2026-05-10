@@ -16,12 +16,11 @@ use crate::{
     application::ingest::{
         IngestOptions, ingest_source_range, validate_contract_code_at_boundaries,
     },
+    application::ports::ScanSummary,
     domain::job::{JobStatus, JobType},
     infra::{
         evm::rpc::EvmRpcClient,
-        postgres::{
-            ledger_repository::ScanSummary, models::JobRow, repositories::PostgresRepositories,
-        },
+        postgres::{models::JobRow, repositories::PostgresRepositories},
     },
 };
 

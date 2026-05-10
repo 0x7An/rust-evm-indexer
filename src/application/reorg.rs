@@ -4,12 +4,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::infra::{
-    evm::rpc::EvmRpcClient,
-    postgres::{
-        ledger_repository::{IndexedBlockHash, LedgerRepository, ReorgEventInsert},
-        models::SourceRow,
-    },
+use crate::application::ports::{
+    ChainRpc, IndexedBlockHash, ReorgEventInsert, ReorgRepository, SourceDescriptor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,9 +23,9 @@ pub struct ReorgMismatch {
 }
 
 pub async fn verify_source_reorgs(
-    rpc: &EvmRpcClient,
-    ledger: &LedgerRepository,
-    source: &SourceRow,
+    rpc: &impl ChainRpc,
+    ledger: &impl ReorgRepository,
+    source: &impl SourceDescriptor,
     from_block: u64,
     to_block: u64,
 ) -> Result<ReorgVerification> {
@@ -40,13 +36,13 @@ pub async fn verify_source_reorgs(
     let to = i64::try_from(to_block).context("to-block exceeds postgres bigint storage")?;
 
     let mut expected = ledger
-        .indexed_block_hashes(source.id, from, to)
+        .indexed_block_hashes(source.source_id(), from, to)
         .context("load indexed block hashes")?
         .into_iter()
         .collect::<BTreeSet<_>>();
 
     if let Some(checkpoint) = ledger
-        .checkpoint_for_source(source.id)
+        .checkpoint_for_source(source.source_id())
         .context("load checkpoint for reorg verification")?
         && checkpoint.processed_block >= from
         && checkpoint.processed_block <= to
@@ -77,15 +73,15 @@ pub async fn verify_source_reorgs(
     record_reorg_ranges(ledger, source, &mismatches)?;
 
     Ok(ReorgVerification {
-        source_id: source.id,
+        source_id: source.source_id(),
         checked_blocks,
         mismatches,
     })
 }
 
 fn record_reorg_ranges(
-    ledger: &LedgerRepository,
-    source: &SourceRow,
+    ledger: &impl ReorgRepository,
+    source: &impl SourceDescriptor,
     mismatches: &[ReorgMismatch],
 ) -> Result<()> {
     let Some(first) = mismatches.first() else {
@@ -108,16 +104,16 @@ fn record_reorg_ranges(
 }
 
 fn record_reorg_range(
-    ledger: &LedgerRepository,
-    source: &SourceRow,
+    ledger: &impl ReorgRepository,
+    source: &impl SourceDescriptor,
     range: &[ReorgMismatch],
 ) -> Result<()> {
     let first = range.first().context("reorg range cannot be empty")?;
     let last = range.last().context("reorg range cannot be empty")?;
     ledger
         .record_reorg_event(ReorgEventInsert {
-            source_id: source.id,
-            chain_id: source.chain_id,
+            source_id: source.source_id(),
+            chain_id: source.chain_id(),
             from_block: first.block_number,
             to_block: last.block_number,
             expected_block_hash: Some(first.expected_block_hash.clone()),

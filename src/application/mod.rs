@@ -5,5 +5,7 @@
 //! ports defined here in later checkpoints.
 
 pub mod backfill;
+pub mod evm;
 pub mod ingest;
+pub mod ports;
 pub mod reorg;

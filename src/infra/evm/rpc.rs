@@ -6,29 +6,17 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::decoder::{RpcLog, TokenStandard, supported_topic0_values};
+use crate::application::{
+    evm::{RpcLog, TokenStandard, parse_hex_u64, supported_topic0_values},
+    ports::{ChainRpc, TransactionReceipt},
+};
+
+pub type RpcTransactionReceipt = TransactionReceipt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockMetadata {
     pub hash: String,
     pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RpcTransactionReceipt {
-    pub transaction_hash: String,
-    pub transaction_index: String,
-    pub block_hash: String,
-    pub block_number: String,
-    pub from: String,
-    pub to: Option<String>,
-    pub contract_address: Option<String>,
-    pub status: Option<String>,
-    pub gas_used: String,
-    pub cumulative_gas_used: String,
-    pub effective_gas_price: Option<String>,
-    pub transaction_type: Option<String>,
-    pub raw: Value,
 }
 
 #[derive(Clone)]
@@ -53,7 +41,7 @@ impl EvmRpcClient {
         let block = value
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("eth_blockNumber result was not a string"))?;
-        super::decoder::parse_hex_u64(block)
+        parse_hex_u64(block)
     }
 
     pub async fn code_at(&self, contract_address: &str, block: u64) -> Result<String> {
@@ -94,7 +82,7 @@ impl EvmRpcClient {
             .get("timestamp")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("eth_getBlockByNumber result missing timestamp"))?;
-        let timestamp_seconds = super::decoder::parse_hex_u64(timestamp_hex)
+        let timestamp_seconds = parse_hex_u64(timestamp_hex)
             .with_context(|| format!("parse block timestamp for block {block}"))?;
         let timestamp_seconds = i64::try_from(timestamp_seconds)
             .with_context(|| format!("block {block} timestamp is too large"))?;
@@ -123,10 +111,7 @@ impl EvmRpcClient {
         serde_json::from_value(value).context("decode eth_getLogs response")
     }
 
-    pub async fn transaction_receipt(
-        &self,
-        transaction_hash: &str,
-    ) -> Result<RpcTransactionReceipt> {
+    pub async fn transaction_receipt(&self, transaction_hash: &str) -> Result<TransactionReceipt> {
         let value = self
             .call("eth_getTransactionReceipt", json!([transaction_hash]))
             .await?;
@@ -136,7 +121,7 @@ impl EvmRpcClient {
 
         let fields = serde_json::from_value::<RpcTransactionReceiptFields>(value.clone())
             .context("decode eth_getTransactionReceipt response")?;
-        Ok(RpcTransactionReceipt {
+        Ok(TransactionReceipt {
             transaction_hash: fields.transaction_hash,
             transaction_index: fields.transaction_index,
             block_hash: fields.block_hash,
@@ -195,6 +180,38 @@ impl EvmRpcClient {
         response
             .result
             .ok_or_else(|| anyhow::anyhow!("RPC {method} response missing result"))
+    }
+}
+
+impl ChainRpc for EvmRpcClient {
+    async fn block_number(&self) -> Result<u64> {
+        EvmRpcClient::block_number(self).await
+    }
+
+    async fn code_at(&self, contract_address: &str, block: u64) -> Result<String> {
+        EvmRpcClient::code_at(self, contract_address, block).await
+    }
+
+    async fn block_hash(&self, block: u64) -> Result<String> {
+        EvmRpcClient::block_hash(self, block).await
+    }
+
+    async fn block_timestamp(&self, block: u64) -> Result<chrono::DateTime<Utc>> {
+        EvmRpcClient::block_timestamp(self, block).await
+    }
+
+    async fn logs(
+        &self,
+        contract_address: &str,
+        standard: TokenStandard,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<RpcLog>> {
+        EvmRpcClient::logs(self, contract_address, standard, from_block, to_block).await
+    }
+
+    async fn transaction_receipt(&self, transaction_hash: &str) -> Result<TransactionReceipt> {
+        EvmRpcClient::transaction_receipt(self, transaction_hash).await
     }
 }
 

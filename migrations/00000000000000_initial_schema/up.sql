@@ -179,5 +179,10 @@ CREATE INDEX idx_token_balances_current_holders ON token_balances(source_id, bal
 
 CREATE INDEX idx_jobs_status_lease_created ON jobs(status, lease_expires_at, created_at);
 CREATE INDEX idx_jobs_source_status ON jobs(source_id, status);
+CREATE UNIQUE INDEX idx_jobs_unique_source_type_range
+    ON jobs(source_id, job_type, from_block, to_block)
+    WHERE source_id IS NOT NULL
+      AND from_block IS NOT NULL
+      AND to_block IS NOT NULL;
 CREATE INDEX idx_job_attempts_job_attempt ON job_attempts(job_id, attempt_number);
 CREATE INDEX idx_reorg_events_source_detected ON reorg_events(source_id, detected_at);

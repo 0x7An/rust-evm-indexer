@@ -13,15 +13,19 @@ use diesel::{
     upsert::excluded,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    domain::job::{JobStatus, JobType},
-    infra::evm::{
-        decoder::{DecodedLog, RpcLog, TokenStandard, parse_hex_u64},
-        rpc::RpcTransactionReceipt,
+    application::{
+        evm::{DecodedLedgerEntry, DecodedLog, RpcLog, TokenStandard, parse_hex_u64},
+        ports::{
+            IndexedBlockHash, LedgerIngestRepository, PersistDecodedLogsOptions, ReorgEventInsert,
+            ReorgRepository, ScanSummary, SourceCheckpoint, SourceDescriptor, SourceRef,
+            TokenBalanceSnapshot, TransactionReceipt,
+        },
     },
+    domain::job::{JobStatus, JobType},
 };
 
 use super::{
@@ -36,18 +40,6 @@ use super::{
         transaction_receipts,
     },
 };
-
-#[derive(Debug, Clone)]
-pub struct ScanSummary {
-    pub source_id: Uuid,
-    pub events_seen: usize,
-    pub events_persisted: usize,
-    pub ledger_entries_persisted: usize,
-    pub transaction_receipts_persisted: usize,
-    pub holder_count: i64,
-    pub minter_count: i64,
-    pub top_holders: Vec<TokenBalanceRow>,
-}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ContractSummary {
@@ -112,29 +104,6 @@ pub struct LogMetadataUpdate {
 pub struct OrphanRangeSummary {
     pub events_orphaned: usize,
     pub ledger_entries_orphaned: usize,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PersistDecodedLogsOptions {
-    pub restore_orphaned_conflicts: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct IndexedBlockHash {
-    pub block_number: i64,
-    pub block_hash: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReorgEventInsert {
-    pub source_id: Uuid,
-    pub chain_id: i64,
-    pub from_block: i64,
-    pub to_block: i64,
-    pub expected_block_hash: Option<String>,
-    pub actual_block_hash: Option<String>,
-    pub replay_job_id: Option<Uuid>,
-    pub mismatches: Value,
 }
 
 #[derive(Debug, QueryableByName)]
@@ -292,7 +261,7 @@ impl LedgerRepository {
 
     pub fn persist_decoded_logs(
         &self,
-        source: &SourceRow,
+        source: &impl SourceDescriptor,
         logs: &[(RpcLog, DecodedLog)],
     ) -> Result<ScanSummary> {
         self.persist_decoded_logs_with_options(source, logs, PersistDecodedLogsOptions::default())
@@ -300,23 +269,24 @@ impl LedgerRepository {
 
     pub fn persist_decoded_logs_with_options(
         &self,
-        source: &SourceRow,
+        source: &impl SourceDescriptor,
         logs: &[(RpcLog, DecodedLog)],
         options: PersistDecodedLogsOptions,
     ) -> Result<ScanSummary> {
+        let source = SourceRef::from_source(source);
         let mut conn = self.connection()?;
         conn.transaction::<ScanSummary, anyhow::Error, _>(|conn| {
-            self.lock_source_for_write_conn(conn, source)?;
+            self.lock_source_for_write_conn(conn, &source)?;
             let mut events_persisted = 0;
             let mut ledger_entries_persisted = 0;
 
             for (log, decoded) in logs {
-                let event_id = self.upsert_event(conn, source, log, decoded, options)?;
+                let event_id = self.upsert_event(conn, &source, log, decoded, options)?;
                 events_persisted += 1;
 
                 for entry in &decoded.entries {
                     let previous =
-                        self.lock_existing_ledger_entry(conn, source, log, entry.batch_index)?;
+                        self.lock_existing_ledger_entry(conn, &source, log, entry.batch_index)?;
                     if previous
                         .as_ref()
                         .is_some_and(|row| row.source_id != source.id)
@@ -329,15 +299,19 @@ impl LedgerRepository {
                         );
                     }
                     let current =
-                        self.upsert_ledger_entry(conn, source, log, event_id, entry, options)?;
-                    self.apply_balance_delta(conn, source, previous.as_ref(), &current)?;
+                        self.upsert_ledger_entry(conn, &source, log, event_id, entry, options)?;
+                    self.apply_balance_delta(conn, &source, previous.as_ref(), &current)?;
                     ledger_entries_persisted += 1;
                 }
             }
 
             let holder_count = self.holder_count_conn(conn, source.id)?;
             let minter_count = self.minter_count_conn(conn, source.id)?;
-            let top_holders = self.top_holders_conn(conn, source.id, 10)?;
+            let top_holders = self
+                .top_holders_conn(conn, source.id, 10)?
+                .into_iter()
+                .map(token_balance_snapshot)
+                .collect();
 
             Ok(ScanSummary {
                 source_id: source.id,
@@ -356,7 +330,7 @@ impl LedgerRepository {
     pub fn persist_transaction_receipts(
         &self,
         chain_id: i64,
-        receipts: &[RpcTransactionReceipt],
+        receipts: &[TransactionReceipt],
     ) -> Result<usize> {
         let mut conn = self.connection()?;
         conn.transaction::<usize, anyhow::Error, _>(|conn| {
@@ -500,7 +474,8 @@ impl LedgerRepository {
 
         let mut conn = self.connection()?;
         conn.transaction::<OrphanRangeSummary, anyhow::Error, _>(|conn| {
-            self.lock_source_for_write_conn(conn, source)?;
+            let source_ref = SourceRef::from_source(source);
+            self.lock_source_for_write_conn(conn, &source_ref)?;
             let rows = ledger_entries::table
                 .filter(ledger_entries::source_id.eq(source.id))
                 .filter(ledger_entries::block_number.ge(from_block))
@@ -518,7 +493,7 @@ impl LedgerRepository {
             for row in &rows {
                 let mut orphaned = row.clone();
                 orphaned.orphaned = true;
-                self.apply_balance_delta(conn, source, Some(row), &orphaned)?;
+                self.apply_balance_delta(conn, &source_ref, Some(row), &orphaned)?;
             }
 
             let ledger_entries_orphaned = diesel::update(
@@ -935,7 +910,7 @@ impl LedgerRepository {
     fn upsert_event(
         &self,
         conn: &mut PgConnection,
-        source: &SourceRow,
+        source: &SourceRef,
         log: &RpcLog,
         decoded: &DecodedLog,
         options: PersistDecodedLogsOptions,
@@ -1007,7 +982,7 @@ impl LedgerRepository {
     fn lock_existing_ledger_entry(
         &self,
         conn: &mut PgConnection,
-        source: &SourceRow,
+        source: &SourceRef,
         log: &RpcLog,
         batch_index: i32,
     ) -> Result<Option<LedgerEntryRow>> {
@@ -1025,10 +1000,10 @@ impl LedgerRepository {
     fn upsert_ledger_entry(
         &self,
         conn: &mut PgConnection,
-        source: &SourceRow,
+        source: &SourceRef,
         log: &RpcLog,
         event_id: Uuid,
-        entry: &crate::infra::evm::decoder::DecodedLedgerEntry,
+        entry: &DecodedLedgerEntry,
         options: PersistDecodedLogsOptions,
     ) -> Result<LedgerEntryRow> {
         let amount = entry
@@ -1095,7 +1070,7 @@ impl LedgerRepository {
         &self,
         conn: &mut PgConnection,
         chain_id: i64,
-        receipt: &RpcTransactionReceipt,
+        receipt: &TransactionReceipt,
     ) -> Result<Uuid> {
         let row = diesel::insert_into(transaction_receipts::table)
             .values(NewTransactionReceiptRow {
@@ -1157,7 +1132,7 @@ impl LedgerRepository {
     fn apply_balance_delta(
         &self,
         conn: &mut PgConnection,
-        source: &SourceRow,
+        source: &SourceRef,
         previous: Option<&LedgerEntryRow>,
         current: &LedgerEntryRow,
     ) -> Result<()> {
@@ -1190,7 +1165,7 @@ impl LedgerRepository {
     fn lock_source_for_write_conn(
         &self,
         conn: &mut PgConnection,
-        source: &SourceRow,
+        source: &SourceRef,
     ) -> Result<()> {
         sources::table
             .filter(sources::id.eq(source.id))
@@ -1204,7 +1179,7 @@ impl LedgerRepository {
     fn apply_holder_balance_delta(
         &self,
         conn: &mut PgConnection,
-        source: &SourceRow,
+        source: &SourceRef,
         holder_address: String,
         token_id: String,
         delta: BalanceDelta,
@@ -1517,6 +1492,50 @@ impl LedgerRepository {
     }
 }
 
+impl LedgerIngestRepository for LedgerRepository {
+    fn persist_decoded_logs_with_options(
+        &self,
+        source: &impl SourceDescriptor,
+        logs: &[(RpcLog, DecodedLog)],
+        options: PersistDecodedLogsOptions,
+    ) -> Result<ScanSummary> {
+        LedgerRepository::persist_decoded_logs_with_options(self, source, logs, options)
+    }
+
+    fn persist_transaction_receipts(
+        &self,
+        chain_id: i64,
+        receipts: &[TransactionReceipt],
+    ) -> Result<usize> {
+        LedgerRepository::persist_transaction_receipts(self, chain_id, receipts)
+    }
+}
+
+impl ReorgRepository for LedgerRepository {
+    fn indexed_block_hashes(
+        &self,
+        source_id: Uuid,
+        from_block: i64,
+        to_block: i64,
+    ) -> Result<Vec<IndexedBlockHash>> {
+        LedgerRepository::indexed_block_hashes(self, source_id, from_block, to_block)
+    }
+
+    fn checkpoint_for_source(&self, source_id: Uuid) -> Result<Option<SourceCheckpoint>> {
+        LedgerRepository::checkpoint_for_source(self, source_id).map(|checkpoint| {
+            checkpoint.map(|checkpoint| SourceCheckpoint {
+                processed_block: checkpoint.processed_block,
+                processed_block_hash: checkpoint.processed_block_hash,
+                finalized_block: checkpoint.finalized_block,
+            })
+        })
+    }
+
+    fn record_reorg_event(&self, event: ReorgEventInsert) -> Result<()> {
+        LedgerRepository::record_reorg_event(self, event).map(|_| ())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BalanceDelta {
     balance_delta: BigDecimal,
@@ -1593,11 +1612,25 @@ impl From<TokenBalanceRow> for HolderBalance {
         Self {
             holder_address: row.holder_address,
             token_id: row.token_id,
-            balance: row.balance.to_string(),
+            balance: balance_string(row.balance),
             first_received_block: row.first_received_block,
             last_moved_block: row.last_moved_block,
         }
     }
+}
+
+fn token_balance_snapshot(row: TokenBalanceRow) -> TokenBalanceSnapshot {
+    TokenBalanceSnapshot {
+        holder_address: row.holder_address,
+        token_id: row.token_id,
+        balance: balance_string(row.balance),
+        first_received_block: row.first_received_block,
+        last_moved_block: row.last_moved_block,
+    }
+}
+
+fn balance_string(balance: BigDecimal) -> String {
+    balance.normalized().to_string()
 }
 
 impl From<LedgerEntryRow> for LedgerTransfer {

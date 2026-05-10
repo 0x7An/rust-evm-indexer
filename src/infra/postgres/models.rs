@@ -4,6 +4,8 @@ use diesel::prelude::*;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::application::ports::SourceDescriptor;
+
 use super::schema::{
     chains, checkpoints, events, job_attempts, jobs, ledger_entries, reorg_events, sources,
     token_balances, transaction_receipts,
@@ -41,6 +43,24 @@ pub struct SourceRow {
     pub start_block: i64,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+}
+
+impl SourceDescriptor for SourceRow {
+    fn source_id(&self) -> Uuid {
+        self.id
+    }
+
+    fn chain_id(&self) -> i64 {
+        self.chain_id
+    }
+
+    fn contract_address(&self) -> &str {
+        &self.contract_address
+    }
+
+    fn token_standard(&self) -> &str {
+        &self.token_standard
+    }
 }
 
 #[derive(Debug, Clone, Insertable)]

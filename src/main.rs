@@ -7,16 +7,18 @@ use indexer_rs::{
     api,
     application::{
         backfill::{BackfillPlan, plan_backfill_jobs},
+        evm::TokenStandard,
         ingest::{
             IngestOptions, PrefetchedLogChunk, detect_token_standard,
             detect_token_standard_with_prefetched_logs, ingest_source_range, normalize_address,
             redact_rpc_url, resolve_finalized_range, validate_contract_code_at_boundaries,
         },
+        ports::ScanSummary,
         reorg::verify_source_reorgs,
     },
     domain::job::{JobStatus, JobType},
     infra::{
-        evm::{decoder::TokenStandard, rpc::EvmRpcClient},
+        evm::rpc::EvmRpcClient,
         postgres::{
             connection::build_pool,
             job_repository::{EnqueueResult, JobStatusCount, NewJob},
@@ -1557,7 +1559,7 @@ fn print_backfill_plan(contract: &str, chain_name: &str, chain_id: i64, plan: &B
     println!("Existing jobs: {}", plan.existing_jobs);
 }
 
-fn print_scan_summary(summary: &indexer_rs::infra::postgres::ledger_repository::ScanSummary) {
+fn print_scan_summary(summary: &ScanSummary) {
     println!("RPC logs decoded: {}", summary.events_seen);
     println!("Events persisted: {}", summary.events_persisted);
     println!(

@@ -2,16 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 
-use crate::infra::{
-    evm::{
-        decoder::{
-            RpcLog, TokenStandard, decode_log, detect_token_standard_from_log, parse_hex_u64,
-        },
-        rpc::{EvmRpcClient, RpcTransactionReceipt},
-    },
-    postgres::{
-        ledger_repository::{LedgerRepository, PersistDecodedLogsOptions, ScanSummary},
-        models::SourceRow,
+use crate::application::{
+    evm::{RpcLog, TokenStandard, decode_log, detect_token_standard_from_log, parse_hex_u64},
+    ports::{
+        ChainRpc, LedgerIngestRepository, PersistDecodedLogsOptions, ScanSummary, SourceDescriptor,
+        TransactionReceipt,
     },
 };
 
@@ -50,7 +45,7 @@ struct FetchLogsOptions {
 }
 
 pub async fn resolve_finalized_range(
-    rpc: &EvmRpcClient,
+    rpc: &impl ChainRpc,
     from_block: Option<&str>,
     to_block: &str,
     lookback: u64,
@@ -81,9 +76,9 @@ pub async fn resolve_finalized_range(
 
 /// Ingest a finalized source range after the caller has validated the contract code boundary.
 pub async fn ingest_source_range(
-    rpc: &EvmRpcClient,
-    ledger: &LedgerRepository,
-    source: &SourceRow,
+    rpc: &impl ChainRpc,
+    ledger: &impl LedgerIngestRepository,
+    source: &impl SourceDescriptor,
     from: u64,
     to: u64,
     chunk_size: u64,
@@ -98,13 +93,13 @@ pub async fn ingest_source_range(
 
     let mut prefetched_logs = options.prefetched_logs;
     let mut standard = source
-        .token_standard
+        .token_standard()
         .parse::<TokenStandard>()
-        .with_context(|| format!("parse token standard {}", source.token_standard))?;
+        .with_context(|| format!("parse token standard {}", source.token_standard()))?;
     if standard.is_auto() {
         let detection = detect_token_standard_with_prefetched_logs(
             rpc,
-            &source.contract_address,
+            source.contract_address(),
             from,
             to,
             chunk_size,
@@ -118,7 +113,7 @@ pub async fn ingest_source_range(
 
     let mut logs = fetch_logs_in_chunks_with_progress(
         rpc,
-        &source.contract_address,
+        source.contract_address(),
         standard,
         from,
         to,
@@ -162,7 +157,7 @@ pub async fn ingest_source_range(
             .await
             .context("fetch transaction receipts")?;
         summary.transaction_receipts_persisted = ledger
-            .persist_transaction_receipts(source.chain_id, &receipts)
+            .persist_transaction_receipts(source.chain_id(), &receipts)
             .context("persist transaction receipts")?;
     }
 
@@ -170,7 +165,7 @@ pub async fn ingest_source_range(
 }
 
 pub async fn fetch_logs_in_chunks(
-    rpc: &EvmRpcClient,
+    rpc: &impl ChainRpc,
     contract: &str,
     standard: TokenStandard,
     from: u64,
@@ -190,7 +185,7 @@ pub async fn fetch_logs_in_chunks(
 }
 
 pub async fn validate_contract_code_at_boundaries(
-    rpc: &EvmRpcClient,
+    rpc: &impl ChainRpc,
     contract: &str,
     chain_label: &str,
     from: u64,
@@ -209,7 +204,7 @@ pub async fn validate_contract_code_at_boundaries(
 }
 
 async fn validate_contract_code_at_block(
-    rpc: &EvmRpcClient,
+    rpc: &impl ChainRpc,
     contract: &str,
     chain_label: &str,
     block: u64,
@@ -226,7 +221,7 @@ async fn validate_contract_code_at_block(
 }
 
 pub async fn detect_token_standard(
-    rpc: &EvmRpcClient,
+    rpc: &impl ChainRpc,
     contract: &str,
     from: u64,
     to: u64,
@@ -241,7 +236,7 @@ pub async fn detect_token_standard(
 }
 
 pub async fn detect_token_standard_with_prefetched_logs(
-    rpc: &EvmRpcClient,
+    rpc: &impl ChainRpc,
     contract: &str,
     from: u64,
     to: u64,
@@ -322,7 +317,7 @@ pub fn detect_token_standard_from_logs(logs: &[RpcLog]) -> Result<Option<TokenSt
 }
 
 async fn fetch_logs_in_chunks_with_progress(
-    rpc: &EvmRpcClient,
+    rpc: &impl ChainRpc,
     contract: &str,
     standard: TokenStandard,
     from: u64,
@@ -377,7 +372,7 @@ async fn fetch_logs_in_chunks_with_progress(
 }
 
 async fn attach_block_timestamps(
-    rpc: &EvmRpcClient,
+    rpc: &impl ChainRpc,
     logs: &mut [RpcLog],
     progress: bool,
 ) -> Result<()> {
@@ -416,10 +411,10 @@ async fn attach_block_timestamps(
 }
 
 async fn fetch_transaction_receipts(
-    rpc: &EvmRpcClient,
+    rpc: &impl ChainRpc,
     transaction_hashes: BTreeSet<String>,
     progress: bool,
-) -> Result<Vec<RpcTransactionReceipt>> {
+) -> Result<Vec<TransactionReceipt>> {
     let mut receipts = Vec::with_capacity(transaction_hashes.len());
     let total_receipts = transaction_hashes.len();
     if progress && total_receipts > 0 {
@@ -483,7 +478,7 @@ pub fn redact_rpc_url(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::evm::decoder::event_topic;
+    use crate::application::evm::event_topic;
 
     #[test]
     fn redacts_provider_key_from_rpc_url() {

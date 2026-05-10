@@ -2,12 +2,10 @@ use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
 use crate::{
-    domain::job::JobType,
-    infra::postgres::{
-        job_repository::{EnqueueResult, NewJob},
-        models::SourceRow,
-        repositories::PostgresRepositories,
+    application::ports::{
+        BackfillRepository, EnqueueRangeJobResult, NewRangeJob, SourceDescriptor,
     },
+    domain::job::JobType,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,8 +34,8 @@ impl BackfillPlan {
 }
 
 pub fn plan_backfill_jobs(
-    repositories: &PostgresRepositories,
-    source: &SourceRow,
+    repositories: &impl BackfillRepository,
+    source: &impl SourceDescriptor,
     from: u64,
     to: u64,
     range_size: u64,
@@ -58,8 +56,7 @@ pub fn plan_backfill_jobs(
     let requested_to = to;
 
     let checkpoint = repositories
-        .ledger()
-        .checkpoint_for_source(source.id)
+        .checkpoint_for_source(source.source_id())
         .context("load source checkpoint")?;
     let from = match checkpoint {
         Some(checkpoint) if checkpoint.processed_block >= 0 => {
@@ -78,25 +75,32 @@ pub fn plan_backfill_jobs(
     let mut existing_jobs = 0;
 
     for range in &ranges {
-        let idempotency_key = format!("backfill:{}:{}:{}", source.id, range.from, range.to);
+        let idempotency_key = format!(
+            "backfill:{}:{}:{}",
+            source.source_id(),
+            range.from,
+            range.to
+        );
         let result = repositories
-            .jobs()
-            .enqueue(
-                NewJob::new(JobType::IngestRange, source.chain_id, idempotency_key)
-                    .with_source(source.id)
-                    .with_range(block_to_i64(range.from)?, block_to_i64(range.to)?)
-                    .with_max_attempts(max_attempts),
-            )
+            .enqueue_range_job(NewRangeJob {
+                job_type: JobType::IngestRange,
+                source_id: source.source_id(),
+                chain_id: source.chain_id(),
+                from_block: block_to_i64(range.from)?,
+                to_block: block_to_i64(range.to)?,
+                idempotency_key,
+                max_attempts,
+            })
             .context("enqueue backfill ingest job")?;
 
         match result {
-            EnqueueResult::Inserted(_) => inserted_jobs += 1,
-            EnqueueResult::Existing(_) => existing_jobs += 1,
+            EnqueueRangeJobResult::Inserted => inserted_jobs += 1,
+            EnqueueRangeJobResult::Existing => existing_jobs += 1,
         }
     }
 
     Ok(BackfillPlan {
-        source_id: source.id,
+        source_id: source.source_id(),
         requested_from,
         requested_to,
         planned_from: ranges.first().map(|range| range.from),

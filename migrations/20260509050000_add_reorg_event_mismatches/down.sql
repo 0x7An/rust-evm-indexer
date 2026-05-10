@@ -1,2 +1,2 @@
 ALTER TABLE reorg_events
-    DROP COLUMN mismatches;
+    DROP COLUMN IF EXISTS mismatches;
