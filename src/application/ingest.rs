@@ -137,10 +137,10 @@ pub async fn ingest_source_range(
         }
     }
     if options.progress {
-        println!(
-            "Decoded {} matching transfer logs with {} unique transactions.",
-            decoded.len(),
-            transaction_hashes.len()
+        tracing::info!(
+            decoded_logs = decoded.len(),
+            unique_transactions = transaction_hashes.len(),
+            "decoded matching transfer logs"
         );
     }
 
@@ -278,8 +278,12 @@ pub async fn detect_token_standard_with_prefetched_logs(
             });
         }
         if progress && should_report_progress(chunk_number, total_chunks) {
-            println!(
-                "Checked token standard detection chunk {chunk_number}/{total_chunks} for blocks {chunk_from}..={chunk_to}."
+            tracing::info!(
+                chunk_number,
+                total_chunks,
+                from_block = chunk_from,
+                to_block = chunk_to,
+                "checked token standard detection chunk"
             );
         }
 
@@ -358,9 +362,13 @@ async fn fetch_logs_in_chunks_with_progress(
         };
         logs.extend(chunk_logs);
         if options.progress && should_report_progress(chunk_number, total_chunks) {
-            println!(
-                "Fetched log chunk {chunk_number}/{total_chunks} for blocks {chunk_from}..={chunk_to}; logs so far: {}.",
-                logs.len()
+            tracing::info!(
+                chunk_number,
+                total_chunks,
+                from_block = chunk_from,
+                to_block = chunk_to,
+                logs_so_far = logs.len(),
+                "fetched log chunk"
             );
         }
 
@@ -385,9 +393,9 @@ async fn attach_block_timestamps(
     }
 
     if progress && !timestamps.is_empty() {
-        println!(
-            "Fetching block timestamps for {} event blocks.",
-            timestamps.len()
+        tracing::info!(
+            block_count = timestamps.len(),
+            "fetching block timestamps for event blocks"
         );
     }
     let total_blocks = timestamps.len();
@@ -400,7 +408,7 @@ async fn attach_block_timestamps(
                 .with_context(|| format!("fetch block timestamp for block {block}"))?,
         );
         if progress && should_report_progress(block_number, total_blocks) {
-            println!("Fetched block timestamp {block_number}/{total_blocks}.");
+            tracing::info!(block_number, total_blocks, "fetched block timestamp");
         }
     }
 
@@ -420,7 +428,7 @@ async fn fetch_transaction_receipts(
     let mut receipts = Vec::with_capacity(transaction_hashes.len());
     let total_receipts = transaction_hashes.len();
     if progress && total_receipts > 0 {
-        println!("Fetching transaction receipts for {total_receipts} unique transactions.");
+        tracing::info!(total_receipts, "fetching transaction receipts");
     }
     for (index, transaction_hash) in transaction_hashes.into_iter().enumerate() {
         receipts.push(
@@ -430,7 +438,11 @@ async fn fetch_transaction_receipts(
         );
         let receipt_number = index + 1;
         if progress && should_report_progress(receipt_number, total_receipts) {
-            println!("Fetched transaction receipt {receipt_number}/{total_receipts}.");
+            tracing::info!(
+                receipt_number,
+                total_receipts,
+                "fetched transaction receipt"
+            );
         }
     }
 

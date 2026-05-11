@@ -308,6 +308,19 @@ impl IngestWorker {
         }
     }
 
+    #[tracing::instrument(
+        name = "execute_job",
+        skip_all,
+        fields(
+            job_id = %job.id,
+            job_type = %job.job_type,
+            chain_id = job.chain_id,
+            source_id = tracing::field::Empty,
+            from_block = tracing::field::Empty,
+            to_block = tracing::field::Empty,
+            worker_id = %self.worker_id,
+        )
+    )]
     async fn execute_job(&self, job: &JobRow) -> Result<ScanSummary> {
         let job_type = job
             .job_type
@@ -320,6 +333,10 @@ impl IngestWorker {
         let source_id = job.source_id.context("range job is missing source_id")?;
         let from = job.from_block.context("range job is missing from_block")?;
         let to = job.to_block.context("range job is missing to_block")?;
+        let span = tracing::Span::current();
+        span.record("source_id", tracing::field::display(source_id));
+        span.record("from_block", from);
+        span.record("to_block", to);
         if from < 0 || to < 0 {
             bail!("range job range cannot be negative");
         }
@@ -337,6 +354,7 @@ impl IngestWorker {
                 source.chain_id
             );
         }
+        span.record("source_id", tracing::field::display(source.id));
         let rpc = self.rpc.clone().with_metric_chain_id(source.chain_id);
         let observed_finalized_block = self.observed_finalized_block(&rpc, source.chain_id).await?;
         if to > observed_finalized_block {
@@ -361,9 +379,15 @@ impl IngestWorker {
                 .orphan_source_range(&source, from, to)
                 .context("orphan replay range")?;
             if self.progress {
-                println!(
-                    "Replay orphaned {} events and {} ledger entries for blocks {from}..={to}.",
-                    orphaned.events_orphaned, orphaned.ledger_entries_orphaned
+                tracing::info!(
+                    job_id = %job.id,
+                    source_id = %source.id,
+                    chain_id = source.chain_id,
+                    from_block = from,
+                    to_block = to,
+                    events_orphaned = orphaned.events_orphaned,
+                    ledger_entries_orphaned = orphaned.ledger_entries_orphaned,
+                    "replay orphaned canonical rows"
                 );
             }
 

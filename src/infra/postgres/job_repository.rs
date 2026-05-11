@@ -330,6 +330,16 @@ impl JobRepository {
             } else {
                 JobStatus::Queued
             };
+            let retry = next_status != JobStatus::DeadLettered;
+            tracing::warn!(
+                job_id = %row.id,
+                job_type = %row.job_type,
+                error_class,
+                attempts = row.attempts,
+                max_attempts = row.max_attempts,
+                retry,
+                "job attempt failed"
+            );
 
             let now = Utc::now();
             let row = diesel::update(jobs::table.filter(jobs::id.eq(row.id)))
@@ -433,12 +443,28 @@ impl JobRepository {
         })
     }
 
+    #[tracing::instrument(
+        name = "job_lease",
+        skip_all,
+        fields(
+            job_type = tracing::field::Empty,
+            chain_id = tracing::field::Empty,
+        )
+    )]
     fn lock_next_candidate(
         &self,
         conn: &mut PgConnection,
         job_type: Option<JobType>,
         chain_id: Option<i64>,
     ) -> QueryResult<Option<JobRow>> {
+        let span = tracing::Span::current();
+        span.record(
+            "job_type",
+            job_type.map(|value| value.as_str()).unwrap_or("any"),
+        );
+        if let Some(chain_id) = chain_id {
+            span.record("chain_id", chain_id);
+        }
         let now = Utc::now();
 
         match (job_type, chain_id) {

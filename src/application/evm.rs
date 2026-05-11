@@ -93,6 +93,16 @@ pub fn supported_topic0_values(standard: TokenStandard) -> Vec<String> {
     }
 }
 
+#[tracing::instrument(
+    name = "event_decode",
+    skip_all,
+    fields(
+        token_standard = standard.as_str(),
+        block_number = %log.block_number,
+        transaction_hash = %log.transaction_hash,
+        log_index = %log.log_index,
+    )
+)]
 pub fn decode_log(log: &RpcLog, standard: TokenStandard) -> Result<Option<DecodedLog>> {
     let standard = if standard.is_auto() {
         let Some(detected) = detect_token_standard_from_log(log)? else {

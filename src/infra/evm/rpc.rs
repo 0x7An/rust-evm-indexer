@@ -146,10 +146,23 @@ impl EvmRpcClient {
         })
     }
 
+    #[tracing::instrument(
+        name = "rpc_fetch",
+        skip_all,
+        fields(
+            rpc_method = method,
+            chain_id = self.metric_chain_id(),
+        )
+    )]
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let result = self.call_inner(method, params).await;
-        if result.is_err() {
+        if let Err(error) = &result {
             metrics::metrics().inc_rpc_error(self.metric_chain_id(), "RpcError");
+            tracing::warn!(
+                error_class = "RpcError",
+                error = %error,
+                "RPC request failed"
+            );
         }
         result
     }

@@ -253,6 +253,16 @@ impl LedgerRepository {
         self.persist_decoded_logs_with_options(source, logs, PersistDecodedLogsOptions::default())
     }
 
+    #[tracing::instrument(
+        name = "db_insert",
+        skip_all,
+        fields(
+            source_id = tracing::field::Empty,
+            chain_id = tracing::field::Empty,
+            contract_address = tracing::field::Empty,
+            log_count = logs.len(),
+        )
+    )]
     pub fn persist_decoded_logs_with_options(
         &self,
         source: &impl SourceDescriptor,
@@ -260,6 +270,10 @@ impl LedgerRepository {
         options: PersistDecodedLogsOptions,
     ) -> Result<ScanSummary> {
         let source = SourceRef::from_source(source);
+        let span = tracing::Span::current();
+        span.record("source_id", tracing::field::display(source.id));
+        span.record("chain_id", source.chain_id);
+        span.record("contract_address", source.contract_address.as_str());
         let started = Instant::now();
         let mut conn = self.connection()?;
         let result = conn.transaction::<ScanSummary, anyhow::Error, _>(|conn| {
@@ -630,6 +644,15 @@ impl LedgerRepository {
         })
     }
 
+    #[tracing::instrument(
+        name = "checkpoint_update",
+        skip_all,
+        fields(
+            source_id = %source_id,
+            processed_block,
+            finalized_block,
+        )
+    )]
     pub fn advance_checkpoint(
         &self,
         source_id: Uuid,
