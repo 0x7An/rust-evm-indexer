@@ -17,7 +17,7 @@ V1 targets standard token ledger events for ERC-20, ERC-721, and ERC-1155 contra
 
 V1 focuses on a single-chain, Postgres-backed indexer with conservative finalized-block ingestion.
 
-Planned stack:
+Implemented stack:
 
 - Rust
 - Tokio
@@ -75,6 +75,8 @@ Layer responsibilities:
 
 Infrastructure types must not leak into `domain` or `application`.
 
+For a more detailed system overview, see [docs/architecture.md](docs/architecture.md).
+
 ## Development Checkpoints
 
 This repository is intended to grow through small, reviewable checkpoints:
@@ -98,7 +100,9 @@ Each checkpoint should keep the project buildable, include focused validation, a
 
 ## Current Status
 
-Checkpoint 12 is complete. The project currently contains the public Rust skeleton, pure domain model, Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, cursor-paginated read APIs, incremental holder balance materialization, event block/log metadata for querying ledger history by real on-chain time, optional transaction receipt ingestion for transaction sender/status/gas provenance, and repair commands for metadata or receipt gaps. Replay support and observability will be introduced in later checkpoints.
+Checkpoint 14 is complete. The project currently contains the public Rust skeleton, pure domain model, Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, cursor-paginated read APIs, incremental holder balance materialization, event block/log metadata for querying ledger history by real on-chain time, optional transaction receipt ingestion for transaction sender/status/gas provenance, repair commands for metadata or receipt gaps, audit-preserving replay, reorg verification, Prometheus metrics, request IDs, structured tracing, and an operator doctor command.
+
+For copy/paste demo commands, see [docs/demo.md](docs/demo.md).
 
 ## Development
 
@@ -118,6 +122,16 @@ DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs diesel migrati
 cargo test
 ```
 
+GitHub Actions runs the same format, check, test, and clippy gates on pushes and
+pull requests.
+
+Optional dependency and advisory checks:
+
+```sh
+cargo audit
+cargo deny check
+```
+
 ## Local Database
 
 Start Postgres with Docker Compose:
@@ -134,6 +148,17 @@ DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs diesel migrati
 
 The local credentials are for development only. Use real secrets outside local
 development.
+
+## Configuration
+
+Create a local `.env` from the committed template:
+
+```sh
+cp .env.example .env
+```
+
+Then edit `.env` with your own RPC provider keys. `.env` is intentionally
+unversioned.
 
 ## Live Contract Scan
 
@@ -193,12 +218,12 @@ Ethereum ERC-721 repeatable example:
 cargo run -- scan-contract \
   --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
   --standard erc721 \
-  --from-block 19700000 \
-  --to-block 19701000 \
+  --from-block 12287507 \
+  --to-block 12288507 \
   --chunk-size 10
 ```
 
-The default chunk size is 10 blocks so the command works with RPC providers that tightly limit `eth_getLogs` ranges. Increase `--chunk-size` when your provider plan allows wider log queries. The default `latest` end block resolves to `head - finality_confirmations`, and the command verifies that the contract has bytecode at both selected range boundaries before printing decoded log counts, persisted ledger entries, minters, and current holders for the indexed block slice.
+The default chunk size is 10 blocks so the command works with RPC providers that tightly limit `eth_getLogs` ranges. Increase `--chunk-size` when your provider plan allows wider log queries. The default `latest` end block resolves to `head - finality_confirmations`, and the command verifies that the contract has bytecode at both selected range boundaries before printing decoded log counts, persisted ledger entries, minters, and current holders for the indexed block slice. For contracts with holder balance materialization, ad-hoc mid-history slices can fail if the range contains an outgoing transfer whose earlier incoming transfer was outside the indexed history. Start at the contract's first transfer block, or continue from an existing contiguous checkpoint, when you need holder balances.
 
 Use `--standard auto` when you do not want to choose the token standard
 manually. The CLI probes the selected range in small log chunks until it finds
@@ -439,6 +464,10 @@ RUST_LOG=info LOG_FORMAT=json cargo run -- worker run --metrics-bind 127.0.0.1:9
 `RUST_LOG` defaults to `info`. `LOG_FORMAT=json` emits JSON Lines for production
 log pipelines; omit it for human-readable local output.
 
+## Security
+
+See [SECURITY.md](SECURITY.md). Do not commit `.env` or real RPC provider keys.
+
 Contract summary for an indexed Ethereum ERC-721 slice:
 
 ```sh
@@ -499,3 +528,7 @@ Polygon contracts use their own chain id:
 ```sh
 curl http://127.0.0.1:3000/chains/137/contracts/0x2953399124f0cbb46d2cbacd8a89cf0599974963/summary
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
