@@ -29,6 +29,7 @@ Planned stack:
 - Replay/backfill
 - Reorg verification
 - Prometheus metrics
+- Structured tracing
 - CLI doctor/status commands
 
 ## Non-Goals
@@ -428,6 +429,15 @@ worker process metrics such as job backlog/failure counters, worker lease
 failures, processed event counters, RPC error counters, DB write duration
 histograms, head/finalized/processed block gauges, source lag, and detected
 reorg counters.
+
+Structured logs use `tracing` and are configured with environment variables:
+
+```sh
+RUST_LOG=info LOG_FORMAT=json cargo run -- worker run --metrics-bind 127.0.0.1:9101
+```
+
+`RUST_LOG` defaults to `info`. `LOG_FORMAT=json` emits JSON Lines for production
+log pipelines; omit it for human-readable local output.
 
 Contract summary for an indexed Ethereum ERC-721 slice:
 

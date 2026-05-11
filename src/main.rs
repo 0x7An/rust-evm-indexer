@@ -27,7 +27,7 @@ use indexer_rs::{
             job_repository::{EnqueueResult, JobStatusCount, NewJob},
             repositories::PostgresRepositories,
         },
-        telemetry::metrics,
+        telemetry::{metrics, tracing as telemetry_tracing},
     },
     worker::{IngestWorker, WorkerOutcome},
 };
@@ -447,6 +447,7 @@ enum JobCommands {
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    telemetry_tracing::init();
     let cli = Cli::parse();
 
     match cli.command {
