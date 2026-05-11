@@ -1,40 +1,47 @@
 # indexer-rs
 
-`indexer-rs` is a Rust EVM token ledger indexer for application-owned blockchain data infrastructure.
+A Rust EVM token ledger indexer for application-owned blockchain data infrastructure.
 
-The goal is to add a token contract and build a durable ledger registry for it:
+Add a token contract and `indexer-rs` builds a durable ledger registry for it: transfers, mints, burns, current holders, balances, and NFT / ERC-1155 provenance paths. It targets ERC-20, ERC-721, and ERC-1155 contracts on a single EVM chain, ingests only finalized blocks, and persists everything in Postgres.
 
-- transfers
-- mints
-- burns
-- current holders
-- balances
-- NFT and ERC-1155 provenance paths
+It is intentionally not a generic ABI indexer, a mapping runtime, a Graph Node clone, or a decentralized indexing marketplace.
 
-V1 targets standard token ledger events for ERC-20, ERC-721, and ERC-1155 contracts. It is not a generic ABI indexer, mapping runtime, Graph Node clone, or decentralized indexing marketplace.
+## Features
 
-## Scope
+**Indexing**
 
-V1 focuses on a single-chain, Postgres-backed indexer with conservative finalized-block ingestion.
+- ERC-20, ERC-721, and ERC-1155 standard transfer decoding (`Transfer`, `TransferSingle`, `TransferBatch`).
+- Conservative finalization: never advances past `head - finality_confirmations`.
+- Idempotent event and ledger inserts keyed by `(chain, tx hash, log index, batch index)`.
+- Incremental holder balance materialization, not full rebuilds.
+- Token provenance paths queryable by `(contract, token_id)`.
 
-Implemented stack:
+**Durable jobs**
 
-- Rust
-- Tokio
-- Diesel
-- Postgres
-- Axum
-- EVM RPC adapter behind an application port
-- Durable Postgres jobs with leases
-- Replay/backfill
-- Reorg verification
-- Prometheus metrics
-- Structured tracing
-- CLI doctor/status commands
+- Postgres-backed job queue with leases, retries, dead-lettering, and per-attempt audit rows.
+- `INGEST_RANGE` and `REPLAY_RANGE` job types; `FOR UPDATE SKIP LOCKED` leasing.
+- One-shot, drain-until-idle, and daemon worker modes.
+- Schema-enforced uniqueness of `(source_id, job_type, from_block, to_block)`.
+
+**Reorg & replay**
+
+- `verify-reorg` compares stored block hashes against canonical chain hashes.
+- Detected mismatches are coalesced into `reorg_events` rows with per-block hash detail.
+- `enqueue-replay` orphans the affected range, reverses balance effects, and re-ingests canonical logs. Replay jobs do not advance the normal checkpoint.
+
+**Operability**
+
+- `doctor` preflight: DB, migrations, RPC, chain head, source config, checkpoint, job backlog, dead letters.
+- Prometheus metrics exposed by the API and by each worker process (separate `--metrics-bind`).
+- Structured `tracing` with JSON output and per-request request IDs in API error envelopes.
+- Repair commands for legacy event metadata and missing transaction receipts.
+
+**Architecture**
+
+- Clean hexagonal layering. `application/` defines ports (`ChainRpc`, `LedgerIngestRepository`, `BackfillRepository`, `ReorgRepository`). `infra/` implements them with Diesel/Postgres and an EVM JSON-RPC client.
+- Application-layer tests run against fakes — no Postgres or live RPC required.
 
 ## Non-Goals
-
-This project does not aim to support the following in V1:
 
 - arbitrary ABI indexing
 - custom user-defined mappings
@@ -47,62 +54,128 @@ This project does not aim to support the following in V1:
 - Solana
 - dashboard UI
 
+## Quickstart
+
+Requires Rust (stable), Docker, and an EVM JSON-RPC endpoint.
+
+```sh
+# 1. Start Postgres.
+docker compose up -d postgres
+
+# 2. Apply migrations.
+DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs \
+  diesel migration run
+
+# 3. Configure RPC and DB credentials.
+cp .env.example .env
+$EDITOR .env
+
+# 4. Scan a contract slice end-to-end.
+cargo run -- scan-contract \
+  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
+  --standard erc721 \
+  --from-block 12287507 \
+  --to-block 12288507
+
+# 5. Start the read API.
+cargo run -- serve --bind 127.0.0.1:3000
+
+# Get the ledger summary.
+curl http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/summary
+```
+
+For copy-pasteable end-to-end flows including Polygon ERC-1155 and replay/reorg paths, see [docs/demo.md](docs/demo.md).
+
+## CLI
+
+| Command | Purpose |
+|---|---|
+| `scan-contract` | Synchronous index of a finalized range. Useful for ad-hoc slices and demos. |
+| `enqueue-contract` | Insert a single durable `INGEST_RANGE` job for the selected range. |
+| `backfill-contract` | Plan a multi-job backfill, splitting a range into deterministic chunks. |
+| `enqueue-replay` | Insert a `REPLAY_RANGE` job over an already-indexed range; links matching `reorg_events`. |
+| `verify-reorg` | Compare stored block hashes to canonical chain hashes, record mismatches. |
+| `backfill-event-metadata` | Repair `block_timestamp`/`topics`/`data` on legacy event rows. |
+| `backfill-transaction-receipts` | Fetch and persist `eth_getTransactionReceipt` for ledger rows missing receipts. |
+| `worker run-once` / `worker run` | Lease and execute durable jobs. `run` polls until idle or forever; `--metrics-bind` exposes worker-local metrics. |
+| `jobs status` | Group jobs by status, optionally filtered by chain, source, or type. |
+| `doctor` | Operator preflight against a chain + contract. Non-zero exit on failure. |
+| `serve` | Run the Axum read API. |
+
+Use `--standard auto` on `scan-contract`, `enqueue-contract`, and `backfill-contract` to detect the standard from log shape. Detection probes the range in small chunks and persists the resolved standard.
+
+The default `eth_getLogs` chunk size is 10 blocks to fit conservative RPC plans. Increase with `--chunk-size` when your provider allows wider queries.
+
+## HTTP API
+
+The read API runs on whatever address you pass to `serve` (default `127.0.0.1:3000`).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Liveness check. |
+| `GET` | `/metrics` | Prometheus exposition for the API process. |
+| `GET` | `/chains/:chain_id/contracts/:address/summary` | Counts, checkpoint, lag for an indexed source. |
+| `GET` | `/chains/:chain_id/contracts/:address/holders` | Current holders with balance > 0. |
+| `GET` | `/chains/:chain_id/contracts/:address/minters` | Distinct minter addresses with mint counts. |
+| `GET` | `/chains/:chain_id/contracts/:address/transfers` | Cursor-paginated ledger transfers; filters: `from_block`, `to_block`, `token_id`, `movement_type`. |
+| `GET` | `/chains/:chain_id/contracts/:address/tokens/:token_id/path` | Chronological provenance for a single NFT or ERC-1155 token id. |
+
+Pagination uses opaque `cursor=...` values returned alongside `items` as `next_cursor`. Errors carry a stable shape with a `request_id` for log correlation:
+
+```json
+{ "error": "from_block cannot be greater than to_block", "request_id": "..." }
+```
+
+## Observability
+
+Prometheus metrics follow the spec's twelve series with conforming labels:
+
+```
+indexer_head_block{chain_id}
+indexer_finalized_block{chain_id}
+indexer_processed_block{chain_id, source_id}
+indexer_source_lag_blocks{chain_id, source_id}
+indexer_job_backlog{job_type, status}
+indexer_failed_jobs_total{job_type, error_class}
+indexer_dead_letter_jobs_total{job_type, error_class}
+indexer_events_processed_total{chain_id, source_id, event_name}
+indexer_rpc_errors_total{chain_id, error_class}
+indexer_db_write_duration_ms{operation}
+indexer_reorgs_detected_total{chain_id, source_id}
+indexer_worker_lease_failures_total{worker_id}
+```
+
+Each running process (API, every worker) should be scraped independently. The API exposes `/metrics` on its bind address; workers expose `/metrics` on `--metrics-bind`.
+
+Structured logs use `tracing`:
+
+```sh
+RUST_LOG=info LOG_FORMAT=json cargo run -- worker run --metrics-bind 127.0.0.1:9101
+```
+
+`LOG_FORMAT=json` emits JSON Lines for production log pipelines; omit it for human-readable local output. Job execution and RPC calls emit spans carrying `job_id`, `source_id`, `chain_id`, and (in the API) `request_id`.
+
 ## Architecture
 
-The codebase is organized around clean architecture boundaries:
-
-```txt
+```
 api / cli / worker
         |
         v
-application
+application (ports + use cases)
         |
         v
-domain
-
-infra implements application ports
+domain (invariants)
+        ^
+        |
+infra (Postgres, EVM RPC, telemetry)
 ```
 
-Layer responsibilities:
+- `domain` holds pure business types and invariants. No Diesel, no RPC, no Tokio.
+- `application` owns use cases and traits. Functions are generic over `impl ChainRpc`, `impl LedgerIngestRepository`, etc. — testable against fakes.
+- `infra` implements the application ports with Diesel/Postgres and an EVM JSON-RPC client.
+- `api`, `cli`, `worker` are thin adapters that compose the layers above.
 
-- `domain`: pure business types and invariants.
-- `application`: use cases and ports.
-- `infra`: Diesel/Postgres, EVM RPC, telemetry, and config implementations.
-- `api`: thin Axum adapter.
-- `worker`: thin job execution adapter.
-- `cli`: thin operator adapter.
-- `config`: typed runtime configuration.
-
-Infrastructure types must not leak into `domain` or `application`.
-
-For a more detailed system overview, see [docs/architecture.md](docs/architecture.md).
-
-## Development Checkpoints
-
-This repository is intended to grow through small, reviewable checkpoints:
-
-1. Repo skeleton and README intent
-2. Domain model and tests
-3. Diesel schema and migrations
-4. Job leasing
-5. Live token event scanner
-6. Ledger query API
-7. Ingest worker
-8. Contract backfill planning and checkpoints
-9. Continuous worker loop and job status CLI
-10. Paginated ledger queries
-11. Event block/log metadata
-12. Optional transaction receipt ingestion
-13. Repair/replay support
-14. Observability and doctor CLI
-
-Each checkpoint should keep the project buildable, include focused validation, and produce a clear commit/PR boundary.
-
-## Current Status
-
-Checkpoint 14 is complete. The project currently contains the public Rust skeleton, pure domain model, Diesel/Postgres schema, local database setup, durable job leasing repository tests, a live `scan-contract` CLI, idempotent contract backfill planning, a worker that can run continuously until a queue is drained, source checkpoints, job status visibility, cursor-paginated read APIs, incremental holder balance materialization, event block/log metadata for querying ledger history by real on-chain time, optional transaction receipt ingestion for transaction sender/status/gas provenance, repair commands for metadata or receipt gaps, audit-preserving replay, reorg verification, Prometheus metrics, request IDs, structured tracing, and an operator doctor command.
-
-For copy/paste demo commands, see [docs/demo.md](docs/demo.md).
+More detail in [docs/architecture.md](docs/architecture.md).
 
 ## Development
 
@@ -113,8 +186,13 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-`cargo test` includes Postgres-backed job repository integration tests. Start
-the local database and run migrations before the full test suite:
+The repository ships fakes for the application ports, so the focused suites run without infrastructure:
+
+```sh
+cargo test --test application --test metrics
+```
+
+The full suite needs Postgres. Start it via Docker Compose and run migrations first:
 
 ```sh
 docker compose up -d postgres
@@ -122,412 +200,16 @@ DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs diesel migrati
 cargo test
 ```
 
-GitHub Actions runs the same format, check, test, and clippy gates on pushes and
-pull requests.
-
-Optional dependency and advisory checks:
+CI runs the same `fmt`, `check`, `test`, `clippy` gates against a Postgres service on every push and PR. Supply-chain checks are configured in `deny.toml`:
 
 ```sh
 cargo audit
 cargo deny check
 ```
 
-## Local Database
-
-Start Postgres with Docker Compose:
-
-```sh
-docker compose up -d postgres
-```
-
-Run migrations against the local database:
-
-```sh
-DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs diesel migration run
-```
-
-The local credentials are for development only. Use real secrets outside local
-development.
-
-## Configuration
-
-Create a local `.env` from the committed template:
-
-```sh
-cp .env.example .env
-```
-
-Then edit `.env` with your own RPC provider keys. `.env` is intentionally
-unversioned.
-
-## Live Contract Scan
-
-Set RPC URLs locally instead of committing provider credentials:
-
-```sh
-export DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs
-export ETH_MAINNET_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/your-api-key
-export POLYGON_MAINNET_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/your-api-key
-```
-
-The CLI also loads a local, unversioned `.env` file automatically before
-parsing arguments. Commands with `--chain-id 1` prefer `ETH_MAINNET_RPC_URL`;
-commands with `--chain-id 137` prefer `POLYGON_MAINNET_RPC_URL`; `EVM_RPC_URL`
-is kept as a generic fallback.
-
-Scan an Ethereum ERC-721 contract:
-
-```sh
-cargo run -- scan-contract \
-  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
-  --standard erc721 \
-  --lookback 5000 \
-  --chunk-size 10
-```
-
-Scan a Polygon ERC-1155 contract:
-
-```sh
-cargo run -- scan-contract \
-  --chain-name polygon-mainnet \
-  --chain-id 137 \
-  --finality-confirmations 256 \
-  --contract 0x2953399124f0cbb46d2cbacd8a89cf0599974963 \
-  --standard erc1155 \
-  --lookback 5000 \
-  --chunk-size 10
-```
-
-For repeatable checks, use explicit finalized block ranges:
-
-```sh
-cargo run -- scan-contract \
-  --chain-name polygon-mainnet \
-  --chain-id 137 \
-  --finality-confirmations 256 \
-  --contract 0x2953399124f0cbb46d2cbacd8a89cf0599974963 \
-  --standard erc1155 \
-  --from-block 0x528e895 \
-  --to-block 0x528e895 \
-  --chunk-size 10
-```
-
-Ethereum ERC-721 repeatable example:
-
-```sh
-cargo run -- scan-contract \
-  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
-  --standard erc721 \
-  --from-block 12287507 \
-  --to-block 12288507 \
-  --chunk-size 10
-```
-
-The default chunk size is 10 blocks so the command works with RPC providers that tightly limit `eth_getLogs` ranges. Increase `--chunk-size` when your provider plan allows wider log queries. The default `latest` end block resolves to `head - finality_confirmations`, and the command verifies that the contract has bytecode at both selected range boundaries before printing decoded log counts, persisted ledger entries, minters, and current holders for the indexed block slice. For contracts with holder balance materialization, ad-hoc mid-history slices can fail if the range contains an outgoing transfer whose earlier incoming transfer was outside the indexed history. Start at the contract's first transfer block, or continue from an existing contiguous checkpoint, when you need holder balances.
-
-Use `--standard auto` when you do not want to choose the token standard
-manually. The CLI probes the selected range in small log chunks until it finds
-standard transfer logs, resolves ERC-20, ERC-721, or ERC-1155 from the first
-unambiguous evidence, and persists the concrete detected standard on the source.
-Inline scans reuse the successful probe chunk instead of fetching it again.
-If the range has no standard transfer logs, the log shape is ambiguous, or the
-contract emits multiple token-standard shapes, the command fails with a clear
-error instead of guessing. Hybrid contracts that emit multiple token-standard
-`Transfer` shapes are not supported as a single source in V1.
-
-## Durable Ingestion
-
-For the production-shaped path, enqueue a durable ingestion job instead of running the scan inline:
-
-```sh
-export DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs
-export EVM_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/your-api-key
-
-cargo run -- enqueue-contract \
-  --chain-name polygon-mainnet \
-  --chain-id 137 \
-  --finality-confirmations 256 \
-  --contract 0x2953399124f0cbb46d2cbacd8a89cf0599974963 \
-  --standard erc1155 \
-  --from-block 0x528e895 \
-  --to-block 0x528e895
-```
-
-Then run one worker lease/execution cycle:
-
-```sh
-cargo run -- worker run-once \
-  --worker-id local-worker \
-  --chain-id 137 \
-  --lease-seconds 60 \
-  --chunk-size 10
-```
-
-`enqueue-contract` resolves the finalized range, verifies contract bytecode, creates or updates the source, and inserts an idempotent `INGEST_RANGE` job. `worker run-once` leases the next available ingest job, optionally restricted by `--chain-id`, marks it running, executes the same decoder/persistence path as `scan-contract`, and marks the job succeeded or failed.
-
-Receipt ingestion is opt-in because it adds one `eth_getTransactionReceipt` RPC
-call per unique transaction hash. Enable it when transaction sender/status/gas
-provenance matters for the indexed slice:
-
-```sh
-cargo run -- worker run-once \
-  --worker-id local-worker \
-  --chain-id 137 \
-  --lease-seconds 60 \
-  --chunk-size 10 \
-  --include-transaction-receipts
-```
-
-The same flag is available on `scan-contract` and `worker run`. Receipts are
-upserted into `transaction_receipts` by `(chain_id, transaction_hash)` and keep
-the raw receipt JSON alongside normalized fields such as `from_address`,
-`to_address`, `status`, `gas_used`, and `effective_gas_price`.
-
-If ledger rows were indexed before receipt ingestion was enabled, fetch missing
-receipts later without reprocessing decoded events:
-
-```sh
-cargo run -- backfill-transaction-receipts \
-  --chain-id 1 \
-  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
-  --limit 1000 \
-  --persist-batch-size 100
-```
-
-This command selects distinct indexed transaction hashes that do not yet have a
-receipt row, fetches each receipt through the configured chain RPC URL, and
-upserts results idempotently. It is safe to rerun with another `--limit` until
-there are no missing receipts left.
-
-For larger ranges, plan a resumable backfill. This splits the requested finalized range into deterministic `INGEST_RANGE` jobs and skips ranges that are already covered by the source checkpoint:
-
-```sh
-cargo run -- backfill-contract \
-  --chain-name polygon-mainnet \
-  --chain-id 137 \
-  --finality-confirmations 256 \
-  --contract 0x2953399124f0cbb46d2cbacd8a89cf0599974963 \
-  --standard erc1155 \
-  --from-block 0x528e895 \
-  --to-block latest \
-  --range-size 100
-```
-
-Backfill jobs use `backfill:` idempotency keys based on `source_id`,
-`from_block`, and `to_block`, so rerunning the same command reports existing
-jobs instead of duplicating work. The queue also enforces uniqueness for a
-source, job type, and block range, which prevents overlap with manually enqueued
-ingest jobs for the same range. This is deliberate: the idempotency key namespace
-records whether the row was planned by `enqueue-contract` or `backfill-contract`,
-while the uniqueness constraint enforces one active `INGEST_RANGE` per
-source/range. These jobs are still `INGEST_RANGE` jobs because the command is
-used for initial/full-history ingestion. `BACKFILL_RANGE` is not an active job
-type; replay and repair work uses `REPLAY_RANGE` so the worker can apply
-audit-preserving orphan semantics. After a worker successfully ingests a range,
-it advances the checkpoint only across contiguous completed ranges, so progress
-does not skip gaps when jobs finish out of order.
-
-Newly ingested events persist both ingestion time and on-chain event metadata:
-`block_timestamp`, `transaction_index`, raw `topics`, and raw `data`. If rows were
-indexed before these columns existed, repair them without re-indexing decoded
-ledger entries:
-
-```sh
-cargo run -- backfill-event-metadata \
-  --chain-id 1 \
-  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
-  --limit-blocks 100
-```
-
-This command refetches one-block log slices for indexed blocks missing metadata,
-then updates matching `events` and `ledger_entries` rows.
-
-Verify indexed block hashes against canonical RPC block hashes before replaying
-a suspicious range:
-
-```sh
-cargo run -- verify-reorg \
-  --chain-id 1 \
-  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
-  --from-block 12287507 \
-  --to-block 12300000
-```
-
-The verifier checks stored event block hashes and the source checkpoint hash
-when it falls inside the requested range. Mismatches are persisted to
-`reorg_events` as contiguous affected ranges with a JSON `mismatches` array that
-keeps each block's expected and actual hash; matching ranges leave that table
-unchanged. `verify-reorg` does not enqueue replay automatically. That manual gate
-keeps corrective replay explicit after the operator reviews the mismatch.
-
-After confirming a mismatch, enqueue a replay job for the affected range:
-
-```sh
-cargo run -- enqueue-replay \
-  --chain-id 1 \
-  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
-  --from-block 12287507 \
-  --to-block 12287507
-```
-
-`REPLAY_RANGE` jobs are executed by the same worker. The worker marks existing
-events and ledger entries in the replay range as orphaned, reverses their holder
-balance effects, then fetches canonical logs for that range and persists the new
-current ledger rows. Replay jobs do not advance the normal ingest checkpoint.
-
-Drain a planned full-history backfill until the queue is empty:
-
-```sh
-cargo run -- worker run \
-  --worker-id polygon-worker \
-  --chain-id 137 \
-  --lease-seconds 60 \
-  --chunk-size 100 \
-  --include-transaction-receipts \
-  --metrics-bind 127.0.0.1:9101 \
-  --stop-when-idle
-```
-
-For daemon-style operation, omit `--stop-when-idle`; the worker will keep polling for new jobs. Use `--max-jobs` for bounded local smoke tests. When `--metrics-bind` is set, the worker exposes its own process-local Prometheus endpoint at `/metrics`.
-
-Inspect job progress:
-
-```sh
-cargo run -- jobs status \
-  --chain-id 137 \
-  --contract 0x2953399124f0cbb46d2cbacd8a89cf0599974963 \
-  --job-type INGEST_RANGE
-```
-
-Run an operator health check for a configured source:
-
-```sh
-cargo run -- doctor \
-  --chain-id 1 \
-  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d
-```
-
-`doctor` checks the Postgres connection, pending Diesel migrations, RPC
-reachability, readable chain head, stored source configuration, source
-checkpoint, active job backlog, and dead-lettered job count. It exits non-zero
-for failed required checks and prints warnings for backlog or dead-lettered jobs.
-
-For an ERC-721 full-history run such as Bored Ape Yacht Club, use the Ethereum chain id, the BAYC contract, and a deployment/start block:
-
-```sh
-cargo run -- backfill-contract \
-  --chain-name ethereum-mainnet \
-  --chain-id 1 \
-  --finality-confirmations 64 \
-  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d \
-  --standard erc721 \
-  --from-block <bayc-deploy-block> \
-  --to-block latest \
-  --range-size 1000
-```
-
-## HTTP API
-
-Start the read API after running migrations and indexing at least one contract:
-
-```sh
-export DATABASE_URL=postgres://indexer:indexer@localhost:5432/indexer_rs
-cargo run -- serve --bind 127.0.0.1:3000
-```
-
-Health check:
-
-```sh
-curl http://127.0.0.1:3000/health
-```
-
-Prometheus metrics:
-
-```sh
-curl http://127.0.0.1:3000/metrics
-curl http://127.0.0.1:9101/metrics
-```
-
-Prometheus should scrape every running process. The API endpoint exposes metrics
-recorded by the API process, while `worker run --metrics-bind ...` exposes the
-worker process metrics such as job backlog/failure counters, worker lease
-failures, processed event counters, RPC error counters, DB write duration
-histograms, head/finalized/processed block gauges, source lag, and detected
-reorg counters.
-
-Structured logs use `tracing` and are configured with environment variables:
-
-```sh
-RUST_LOG=info LOG_FORMAT=json cargo run -- worker run --metrics-bind 127.0.0.1:9101
-```
-
-`RUST_LOG` defaults to `info`. `LOG_FORMAT=json` emits JSON Lines for production
-log pipelines; omit it for human-readable local output.
-
 ## Security
 
-See [SECURITY.md](SECURITY.md). Do not commit `.env` or real RPC provider keys.
-
-Contract summary for an indexed Ethereum ERC-721 slice:
-
-```sh
-curl http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/summary
-```
-
-The summary includes ledger counts plus checkpoint progress fields:
-`checkpoint_processed_block` and `checkpoint_finalized_block`.
-
-Current holders in the indexed slice:
-
-```sh
-curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/holders?limit=25"
-```
-
-Minters in the indexed slice:
-
-```sh
-curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/minters?limit=25"
-```
-
-Recent ledger transfers:
-
-```sh
-curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/transfers?limit=25"
-```
-
-Transfer and token-path items include `block_timestamp` and `transaction_index`
-alongside block, transaction hash, log index, token id, amount, and movement
-addresses.
-
-Transfers can be filtered and paged with a stable cursor:
-
-```sh
-curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/transfers?limit=100&from_block=12287507&to_block=12300000&token_id=4785&movement_type=transfer"
-```
-
-The response includes `items` and `next_cursor`. Pass `next_cursor` back as `cursor` to request the next page:
-
-```sh
-curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/transfers?limit=100&cursor=12300000:42:0"
-```
-
-Token provenance path:
-
-```sh
-curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/tokens/4785/path"
-```
-
-Token paths are chronological and support the same cursor, block range, holder, and movement type filters:
-
-```sh
-curl "http://127.0.0.1:3000/chains/1/contracts/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/tokens/4785/path?limit=100"
-```
-
-Polygon contracts use their own chain id:
-
-```sh
-curl http://127.0.0.1:3000/chains/137/contracts/0x2953399124f0cbb46d2cbacd8a89cf0599974963/summary
-```
+See [SECURITY.md](SECURITY.md). Do not commit `.env` files or real RPC provider keys. `.env` is gitignored; `.env.example` is the template.
 
 ## License
 
