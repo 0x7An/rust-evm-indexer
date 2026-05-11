@@ -1,6 +1,10 @@
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
+use axum::{
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
 };
@@ -8,6 +12,24 @@ use prometheus::{
 pub fn metrics() -> &'static Metrics {
     static METRICS: OnceLock<Metrics> = OnceLock::new();
     METRICS.get_or_init(|| Metrics::new().expect("register Prometheus metrics"))
+}
+
+pub async fn prometheus_response() -> Response {
+    match metrics().encode() {
+        Ok(body) => (
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("encode metrics: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Clone)]
@@ -32,33 +54,33 @@ impl Metrics {
         let registry = Registry::new();
         let job_backlog = int_gauge_vec(
             "indexer_job_backlog",
-            "Durable jobs by chain and status.",
-            &["chain_id", "status"],
+            "Durable jobs by type and status.",
+            &["job_type", "status"],
         )?;
         let failed_jobs_total = int_counter_vec(
             "indexer_failed_jobs_total",
-            "Failed worker jobs by chain and job type.",
-            &["chain_id", "job_type"],
+            "Failed worker jobs by type and error class.",
+            &["job_type", "error_class"],
         )?;
         let dead_letter_jobs_total = int_counter_vec(
             "indexer_dead_letter_jobs_total",
-            "Dead-lettered worker jobs by chain and job type.",
-            &["chain_id", "job_type"],
+            "Dead-lettered worker jobs by type and error class.",
+            &["job_type", "error_class"],
         )?;
         let worker_lease_failures_total = int_counter_vec(
             "indexer_worker_lease_failures_total",
-            "Worker lease failures by chain and job type.",
-            &["chain_id", "job_type"],
+            "Worker lease failures by worker id.",
+            &["worker_id"],
         )?;
         let events_processed_total = int_counter_vec(
             "indexer_events_processed_total",
-            "Decoded ledger events persisted by chain, contract, and token standard.",
-            &["chain_id", "contract", "token_standard"],
+            "Decoded ledger events persisted by chain, source, and event name.",
+            &["chain_id", "source_id", "event_name"],
         )?;
         let rpc_errors_total = int_counter_vec(
             "indexer_rpc_errors_total",
-            "RPC errors by operation.",
-            &["operation"],
+            "RPC errors by chain and error class.",
+            &["chain_id", "error_class"],
         )?;
         let db_write_duration_ms = HistogramVec::new(
             HistogramOpts::new(
@@ -142,46 +164,48 @@ impl Metrics {
         String::from_utf8(buffer).context("Prometheus metrics were not UTF-8")
     }
 
-    pub fn set_job_backlog(&self, chain_id: &str, status: &str, count: i64) {
+    pub fn set_job_backlog(&self, job_type: &str, status: &str, count: i64) {
         self.job_backlog
-            .with_label_values(&[chain_id, status])
+            .with_label_values(&[job_type, status])
             .set(count);
     }
 
-    pub fn inc_failed_job(&self, chain_id: &str, job_type: &str) {
+    pub fn inc_failed_job(&self, job_type: &str, error_class: &str) {
         self.failed_jobs_total
-            .with_label_values(&[chain_id, job_type])
+            .with_label_values(&[job_type, error_class])
             .inc();
     }
 
-    pub fn inc_dead_letter_job(&self, chain_id: &str, job_type: &str) {
+    pub fn inc_dead_letter_job(&self, job_type: &str, error_class: &str) {
         self.dead_letter_jobs_total
-            .with_label_values(&[chain_id, job_type])
+            .with_label_values(&[job_type, error_class])
             .inc();
     }
 
-    pub fn inc_worker_lease_failure(&self, chain_id: &str, job_type: &str) {
+    pub fn inc_worker_lease_failure(&self, worker_id: &str) {
         self.worker_lease_failures_total
-            .with_label_values(&[chain_id, job_type])
+            .with_label_values(&[worker_id])
             .inc();
     }
 
     pub fn inc_events_processed(
         &self,
         chain_id: &str,
-        contract: &str,
-        token_standard: &str,
+        source_id: &str,
+        event_name: &str,
         count: u64,
     ) {
         if count > 0 {
             self.events_processed_total
-                .with_label_values(&[chain_id, contract, token_standard])
+                .with_label_values(&[chain_id, source_id, event_name])
                 .inc_by(count);
         }
     }
 
-    pub fn inc_rpc_error(&self, operation: &str) {
-        self.rpc_errors_total.with_label_values(&[operation]).inc();
+    pub fn inc_rpc_error(&self, chain_id: &str, error_class: &str) {
+        self.rpc_errors_total
+            .with_label_values(&[chain_id, error_class])
+            .inc();
     }
 
     pub fn observe_db_write_ms(&self, operation: &str, duration_ms: f64) {

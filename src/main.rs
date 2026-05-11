@@ -1,6 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, time::Duration as StdDuration};
 
 use anyhow::{Context, Result, bail};
+use axum::{Router, routing::get};
 use chrono::Duration;
 use clap::{Parser, Subcommand};
 use diesel::{Connection, PgConnection};
@@ -414,6 +415,10 @@ enum WorkerCommands {
         /// Fetch and persist eth_getTransactionReceipt data for each unique transaction.
         #[arg(long)]
         include_transaction_receipts: bool,
+
+        /// Optional worker-local Prometheus metrics listener.
+        #[arg(long)]
+        metrics_bind: Option<SocketAddr>,
     },
 }
 
@@ -653,6 +658,7 @@ async fn main() -> Result<()> {
                 stop_when_idle,
                 idle_sleep_ms,
                 include_transaction_receipts,
+                metrics_bind,
             } => {
                 let rpc_url = rpc_url_from_args(rpc_url, chain_id)?;
                 worker_run(
@@ -666,6 +672,7 @@ async fn main() -> Result<()> {
                     stop_when_idle,
                     idle_sleep_ms,
                     include_transaction_receipts,
+                    metrics_bind,
                 )
                 .await
             }
@@ -810,7 +817,7 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
         }
     }
 
-    let rpc = EvmRpcClient::new(&rpc_url);
+    let rpc = EvmRpcClient::new(&rpc_url).with_metric_chain_id(chain_id);
     match rpc.block_number().await {
         Ok(head) => {
             checks.push(DoctorCheck::ok(
@@ -1149,7 +1156,7 @@ async fn scan_contract(args: ScanContractArgs) -> Result<()> {
         bail!("chain-id must be greater than zero");
     }
 
-    let rpc = EvmRpcClient::new(&rpc_url);
+    let rpc = EvmRpcClient::new(&rpc_url).with_metric_chain_id(chain_id);
     let range = resolve_finalized_range(
         &rpc,
         from_block.as_deref(),
@@ -1274,7 +1281,7 @@ async fn enqueue_contract(args: EnqueueContractArgs) -> Result<()> {
         bail!("max-attempts must be greater than zero");
     }
 
-    let rpc = EvmRpcClient::new(&rpc_url);
+    let rpc = EvmRpcClient::new(&rpc_url).with_metric_chain_id(chain_id);
     let range = resolve_finalized_range(
         &rpc,
         from_block.as_deref(),
@@ -1393,7 +1400,7 @@ async fn backfill_contract(args: BackfillContractArgs) -> Result<()> {
         bail!("max-attempts must be greater than zero");
     }
 
-    let rpc = EvmRpcClient::new(&rpc_url);
+    let rpc = EvmRpcClient::new(&rpc_url).with_metric_chain_id(chain_id);
     let range = resolve_finalized_range(
         &rpc,
         from_block.as_deref(),
@@ -1552,7 +1559,7 @@ async fn backfill_event_metadata(
         return Ok(());
     }
 
-    let rpc = EvmRpcClient::new(&rpc_url);
+    let rpc = EvmRpcClient::new(&rpc_url).with_metric_chain_id(chain_id);
     let mut rpc_logs_seen = 0usize;
     let mut events_updated = 0usize;
     let mut ledger_entries_updated = 0usize;
@@ -1632,7 +1639,7 @@ async fn backfill_transaction_receipts(
         transaction_hashes.len()
     );
 
-    let rpc = EvmRpcClient::new(&rpc_url);
+    let rpc = EvmRpcClient::new(&rpc_url).with_metric_chain_id(chain_id);
     let mut fetched = 0usize;
     let mut persisted = 0usize;
     let mut batch = Vec::with_capacity(persist_batch_size.min(transaction_hashes.len()));
@@ -1698,7 +1705,7 @@ async fn verify_reorg(
         .source_by_contract(chain_id, &contract)
         .context("load source by contract")?
         .context("contract source not found")?;
-    let rpc = EvmRpcClient::new(&rpc_url);
+    let rpc = EvmRpcClient::new(&rpc_url).with_metric_chain_id(chain_id);
     let verification =
         verify_source_reorgs(&rpc, repositories.ledger(), &source, from_block, to_block).await?;
     metrics::metrics().inc_reorgs_detected(
@@ -1779,6 +1786,7 @@ async fn worker_run(
     stop_when_idle: bool,
     idle_sleep_ms: u64,
     include_transaction_receipts: bool,
+    metrics_bind: Option<SocketAddr>,
 ) -> Result<()> {
     if max_jobs == Some(0) {
         bail!("max-jobs must be greater than zero when provided");
@@ -1793,6 +1801,10 @@ async fn worker_run(
         chunk_size,
         include_transaction_receipts,
     )?;
+    let _metrics_server = match metrics_bind {
+        Some(bind) => Some(start_metrics_server(bind).await?),
+        None => None,
+    };
     let mut attempted_jobs = 0usize;
     let mut printed_idle = false;
 
@@ -1836,6 +1848,32 @@ async fn worker_run(
     }
 }
 
+struct MetricsServer {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MetricsServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn start_metrics_server(bind: SocketAddr) -> Result<MetricsServer> {
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind worker metrics listener on {bind}"))?;
+    let app = Router::new().route("/metrics", get(metrics::prometheus_response));
+    println!("Worker metrics listening on http://{bind}/metrics");
+
+    let handle = tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            eprintln!("Worker metrics listener stopped: {error}");
+        }
+    });
+
+    Ok(MetricsServer { handle })
+}
+
 fn build_worker(
     rpc_url: String,
     database_url: String,
@@ -1854,9 +1892,13 @@ fn build_worker(
 
     let pool = build_pool(&database_url).context("build postgres pool")?;
     let repositories = PostgresRepositories::new(pool);
+    let rpc = match chain_id {
+        Some(chain_id) => EvmRpcClient::new(rpc_url).with_metric_chain_id(chain_id),
+        None => EvmRpcClient::new(rpc_url),
+    };
     let mut worker = IngestWorker::new(
         repositories,
-        EvmRpcClient::new(rpc_url),
+        rpc,
         worker_id,
         Duration::seconds(lease_seconds),
         chunk_size,

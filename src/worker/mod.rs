@@ -38,6 +38,27 @@ pub struct IngestWorker {
     replay_first: Arc<AtomicBool>,
 }
 
+fn all_job_types() -> [JobType; 4] {
+    [
+        JobType::IngestRange,
+        JobType::ReplayRange,
+        JobType::VerifyReorg,
+        JobType::RepairCheckpoint,
+    ]
+}
+
+fn all_job_statuses() -> [JobStatus; 7] {
+    [
+        JobStatus::Queued,
+        JobStatus::Leased,
+        JobStatus::Running,
+        JobStatus::Succeeded,
+        JobStatus::Failed,
+        JobStatus::DeadLettered,
+        JobStatus::Cancelled,
+    ]
+}
+
 impl IngestWorker {
     pub fn new(
         repositories: PostgresRepositories,
@@ -104,6 +125,7 @@ impl IngestWorker {
                         "worker shutdown requested before job completed",
                     )
                     .context("release interrupted job")?;
+                self.observe_job_backlog();
                 Ok(WorkerOutcome::Interrupted {
                     job_id: interrupted.id,
                     status: interrupted.status,
@@ -171,6 +193,7 @@ impl IngestWorker {
             .jobs()
             .mark_running(leased.id)
             .context("mark job running")?;
+        self.observe_job_backlog();
 
         Ok(Some(running))
     }
@@ -190,7 +213,7 @@ impl IngestWorker {
             ),
         };
         if result.is_err() {
-            metrics::metrics().inc_worker_lease_failure(&self.metric_chain_id(), job_type.as_str());
+            metrics::metrics().inc_worker_lease_failure(&self.worker_id);
         }
         result.context("lease next supported job")
     }
@@ -219,12 +242,12 @@ impl IngestWorker {
                     .jobs()
                     .mark_failed(running.id, "IngestJobError", &message)
                     .context("mark job failed")?;
-                let chain_id = failed.chain_id.to_string();
                 let job_type = failed.job_type.clone();
+                let error_class = failed.error_class.as_deref().unwrap_or("unknown");
                 let status = failed.status.clone();
-                metrics::metrics().inc_failed_job(&chain_id, &job_type);
+                metrics::metrics().inc_failed_job(&job_type, error_class);
                 if status == JobStatus::DeadLettered.as_str() {
-                    metrics::metrics().inc_dead_letter_job(&chain_id, &job_type);
+                    metrics::metrics().inc_dead_letter_job(&job_type, error_class);
                 }
                 Ok(WorkerOutcome::Failed {
                     job_id: failed.id,
@@ -236,36 +259,24 @@ impl IngestWorker {
     }
 
     fn observe_job_backlog(&self) {
-        let Ok(counts) = self
-            .repositories
-            .jobs()
-            .status_counts(self.chain_id, None, None)
-        else {
-            return;
-        };
-        let chain_id = self.metric_chain_id();
-        for status in [
-            JobStatus::Queued,
-            JobStatus::Leased,
-            JobStatus::Running,
-            JobStatus::Succeeded,
-            JobStatus::Failed,
-            JobStatus::DeadLettered,
-            JobStatus::Cancelled,
-        ] {
-            let count = counts
-                .iter()
-                .find(|row| row.status == status.as_str())
-                .map(|row| row.count)
-                .unwrap_or(0);
-            metrics::metrics().set_job_backlog(&chain_id, status.as_str(), count);
-        }
-    }
+        for job_type in all_job_types() {
+            let Ok(counts) =
+                self.repositories
+                    .jobs()
+                    .status_counts(self.chain_id, None, Some(job_type))
+            else {
+                return;
+            };
 
-    fn metric_chain_id(&self) -> String {
-        self.chain_id
-            .map(|chain_id| chain_id.to_string())
-            .unwrap_or_else(|| "all".to_string())
+            for status in all_job_statuses() {
+                let count = counts
+                    .iter()
+                    .find(|row| row.status == status.as_str())
+                    .map(|row| row.count)
+                    .unwrap_or(0);
+                metrics::metrics().set_job_backlog(job_type.as_str(), status.as_str(), count);
+            }
+        }
     }
 
     pub async fn run_until_idle(&self, max_jobs: Option<usize>) -> Result<WorkerRunSummary> {
@@ -326,7 +337,8 @@ impl IngestWorker {
                 source.chain_id
             );
         }
-        let observed_finalized_block = self.observed_finalized_block(source.chain_id).await?;
+        let rpc = self.rpc.clone().with_metric_chain_id(source.chain_id);
+        let observed_finalized_block = self.observed_finalized_block(&rpc, source.chain_id).await?;
         if to > observed_finalized_block {
             bail!(
                 "job target block {to} is newer than observed finalized block {observed_finalized_block}"
@@ -334,7 +346,7 @@ impl IngestWorker {
         }
         let chain_label = format!("chain {}", source.chain_id);
         validate_contract_code_at_boundaries(
-            &self.rpc,
+            &rpc,
             &source.contract_address,
             &chain_label,
             from as u64,
@@ -356,7 +368,7 @@ impl IngestWorker {
             }
 
             return ingest_source_range(
-                &self.rpc,
+                &rpc,
                 self.repositories.ledger(),
                 &source,
                 from as u64,
@@ -373,7 +385,7 @@ impl IngestWorker {
         }
 
         let summary = ingest_source_range(
-            &self.rpc,
+            &rpc,
             self.repositories.ledger(),
             &source,
             from as u64,
@@ -398,10 +410,10 @@ impl IngestWorker {
                 return Ok(summary);
             }
 
-            let processed_block_hash =
-                self.rpc.block_hash(target as u64).await.with_context(|| {
-                    format!("fetch block hash for checkpoint at block {target}")
-                })?;
+            let processed_block_hash = rpc
+                .block_hash(target as u64)
+                .await
+                .with_context(|| format!("fetch block hash for checkpoint at block {target}"))?;
             self.repositories
                 .ledger()
                 .advance_checkpoint(
@@ -422,7 +434,7 @@ impl IngestWorker {
         Ok(summary)
     }
 
-    async fn observed_finalized_block(&self, chain_id: i64) -> Result<i64> {
+    async fn observed_finalized_block(&self, rpc: &EvmRpcClient, chain_id: i64) -> Result<i64> {
         let chain = self
             .repositories
             .ledger()
@@ -433,7 +445,7 @@ impl IngestWorker {
             bail!("chain finality_confirmations cannot be negative");
         }
 
-        let head = self.rpc.block_number().await.context("fetch head block")?;
+        let head = rpc.block_number().await.context("fetch head block")?;
         let finalized = head.saturating_sub(chain.finality_confirmations as u64);
         metrics::metrics().set_head_block(&chain_id.to_string(), head);
         metrics::metrics().set_finalized_block(&chain_id.to_string(), finalized);

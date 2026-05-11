@@ -24,6 +24,7 @@ pub struct BlockMetadata {
 pub struct EvmRpcClient {
     client: Client,
     url: String,
+    metric_chain_id: Option<String>,
 }
 
 impl EvmRpcClient {
@@ -34,7 +35,13 @@ impl EvmRpcClient {
                 .build()
                 .expect("build EVM RPC HTTP client"),
             url: url.into(),
+            metric_chain_id: None,
         }
+    }
+
+    pub fn with_metric_chain_id(mut self, chain_id: i64) -> Self {
+        self.metric_chain_id = Some(chain_id.to_string());
+        self
     }
 
     pub async fn block_number(&self) -> Result<u64> {
@@ -142,9 +149,13 @@ impl EvmRpcClient {
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let result = self.call_inner(method, params).await;
         if result.is_err() {
-            metrics::metrics().inc_rpc_error(method);
+            metrics::metrics().inc_rpc_error(self.metric_chain_id(), "RpcError");
         }
         result
+    }
+
+    fn metric_chain_id(&self) -> &str {
+        self.metric_chain_id.as_deref().unwrap_or("unknown")
     }
 
     async fn call_inner(&self, method: &str, params: Value) -> Result<Value> {

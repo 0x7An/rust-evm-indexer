@@ -358,10 +358,11 @@ cargo run -- worker run \
   --lease-seconds 60 \
   --chunk-size 100 \
   --include-transaction-receipts \
+  --metrics-bind 127.0.0.1:9101 \
   --stop-when-idle
 ```
 
-For daemon-style operation, omit `--stop-when-idle`; the worker will keep polling for new jobs. Use `--max-jobs` for bounded local smoke tests.
+For daemon-style operation, omit `--stop-when-idle`; the worker will keep polling for new jobs. Use `--max-jobs` for bounded local smoke tests. When `--metrics-bind` is set, the worker exposes its own process-local Prometheus endpoint at `/metrics`.
 
 Inspect job progress:
 
@@ -418,9 +419,12 @@ Prometheus metrics:
 
 ```sh
 curl http://127.0.0.1:3000/metrics
+curl http://127.0.0.1:9101/metrics
 ```
 
-The metrics endpoint exposes job backlog/failure counters, worker lease
+Prometheus should scrape every running process. The API endpoint exposes metrics
+recorded by the API process, while `worker run --metrics-bind ...` exposes the
+worker process metrics such as job backlog/failure counters, worker lease
 failures, processed event counters, RPC error counters, DB write duration
 histograms, head/finalized/processed block gauges, source lag, and detected
 reorg counters.

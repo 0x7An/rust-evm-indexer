@@ -331,13 +331,16 @@ impl LedgerRepository {
             "persist_decoded_logs",
             started.elapsed().as_secs_f64() * 1_000.0,
         );
-        if let Ok(summary) = &result {
-            metrics::metrics().inc_events_processed(
-                &source.chain_id.to_string(),
-                &source.contract_address,
-                &source.token_standard,
-                summary.events_persisted as u64,
-            );
+        if result.is_ok() {
+            let chain_id = source.chain_id.to_string();
+            let source_id = source.id.to_string();
+            let mut event_counts = HashMap::<&str, u64>::new();
+            for (_, decoded) in logs {
+                *event_counts.entry(decoded.event_name.as_str()).or_default() += 1;
+            }
+            for (event_name, count) in event_counts {
+                metrics::metrics().inc_events_processed(&chain_id, &source_id, event_name, count);
+            }
         }
         result
     }
