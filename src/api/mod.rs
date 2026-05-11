@@ -2,13 +2,17 @@
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderValue, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::Instrument;
+use uuid::Uuid;
 
 use crate::infra::postgres::{
     connection::PgPool,
@@ -18,6 +22,12 @@ use crate::infra::postgres::{
     repositories::PostgresRepositories,
 };
 use crate::infra::telemetry::metrics;
+
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+tokio::task_local! {
+    static CURRENT_REQUEST_ID: String;
+}
 
 #[derive(Clone)]
 struct ApiState {
@@ -51,10 +61,40 @@ pub fn router(pool: PgPool) -> Router {
         .with_state(ApiState {
             repositories: PostgresRepositories::new(pool),
         })
+        .layer(middleware::from_fn(request_id_middleware))
 }
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn request_id_middleware(request: Request<Body>, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let span = tracing::info_span!(
+        "http_request",
+        request_id = %request_id,
+        method = %method,
+        uri = %uri,
+    );
+    let mut response = CURRENT_REQUEST_ID
+        .scope(request_id.clone(), async move {
+            next.run(request).instrument(span).await
+        })
+        .await;
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+
+    response
 }
 
 async fn contract_summary(
@@ -328,12 +368,29 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
-            Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
-            Self::Internal(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        let request_id = CURRENT_REQUEST_ID
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| "unknown".to_string());
+        let (status, class, message) = match self {
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, "BadRequest", message),
+            Self::NotFound(message) => (StatusCode::NOT_FOUND, "NotFound", message),
+            Self::Internal(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                error.to_string(),
+            ),
         };
 
-        (status, Json(json!({ "error": message }))).into_response()
+        (
+            status,
+            Json(json!({
+                "error": {
+                    "class": class,
+                    "message": message,
+                    "request_id": request_id,
+                }
+            })),
+        )
+            .into_response()
     }
 }

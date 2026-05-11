@@ -3,7 +3,7 @@ use std::sync::{Mutex, MutexGuard};
 use axum::{
     Router,
     body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header::CONTENT_TYPE},
 };
 use chrono::{DateTime, Utc};
 use diesel::{Connection, PgConnection, prelude::*};
@@ -279,12 +279,12 @@ async fn returns_clear_client_errors() {
     );
     let (status, body) = get_json(&ctx.app, &missing_uri).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["error"], "contract source not found");
+    assert_api_error(&body, "NotFound", "contract source not found");
 
     let invalid_address_uri = format!("/chains/{}/contracts/not-an-address/summary", ctx.chain_id);
     let (status, body) = get_json(&ctx.app, &invalid_address_uri).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "invalid EVM contract address");
+    assert_api_error(&body, "BadRequest", "invalid EVM contract address");
 
     let invalid_limit_uri = format!(
         "/chains/{}/contracts/{}/holders?limit=0",
@@ -292,7 +292,7 @@ async fn returns_clear_client_errors() {
     );
     let (status, body) = get_json(&ctx.app, &invalid_limit_uri).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "limit must be between 1 and 100");
+    assert_api_error(&body, "BadRequest", "limit must be between 1 and 100");
 
     let invalid_cursor_uri = format!(
         "/chains/{}/contracts/{}/transfers?cursor=not-a-cursor",
@@ -300,7 +300,37 @@ async fn returns_clear_client_errors() {
     );
     let (status, body) = get_json(&ctx.app, &invalid_cursor_uri).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "invalid cursor");
+    assert_api_error(&body, "BadRequest", "invalid cursor");
+}
+
+#[tokio::test]
+async fn exposes_prometheus_metrics_endpoint() {
+    let ctx = setup();
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8")
+    );
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read response body");
+    let body = String::from_utf8(body.to_vec()).expect("metrics response is utf8");
+    assert!(body.contains("indexer_events_processed_total"));
 }
 
 #[tokio::test]
@@ -492,6 +522,16 @@ async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
     let value = serde_json::from_slice(&body).expect("parse JSON response");
 
     (status, value)
+}
+
+fn assert_api_error(body: &Value, class: &str, message: &str) {
+    assert_eq!(body["error"]["class"], class);
+    assert_eq!(body["error"]["message"], message);
+    assert!(
+        body["error"]["request_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
 }
 
 fn seed_ledger(pool: PgPool, chain_id: i64, contract: &str) {
