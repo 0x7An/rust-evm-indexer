@@ -41,19 +41,6 @@ It is intentionally not a generic ABI indexer, a mapping runtime, a Graph Node c
 - Clean hexagonal layering. `application/` defines ports (`ChainRpc`, `LedgerIngestRepository`, `BackfillRepository`, `ReorgRepository`). `infra/` implements them with Diesel/Postgres and an EVM JSON-RPC client.
 - Application-layer tests run against fakes — no Postgres or live RPC required.
 
-## Non-Goals
-
-- arbitrary ABI indexing
-- custom user-defined mappings
-- WASM execution
-- GraphQL query engine
-- Graph Node dependency
-- staking, allocations, TAP/RAV, POI disputes, or query-fee markets
-- IPFS manifests
-- multi-chain orchestration
-- Solana
-- dashboard UI
-
 ## Quickstart
 
 Requires Rust (stable), Docker, and an EVM JSON-RPC endpoint.
