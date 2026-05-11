@@ -9,6 +9,7 @@ use diesel::{Connection, PgConnection, RunQueryDsl, prelude::*};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use indexer_rs::{
     application::reorg::verify_source_reorgs,
+    domain::job::JobType,
     infra::{
         evm::{
             decoder::{DecodedLedgerEntry, DecodedLog, RpcLog, TokenStandard},
@@ -16,10 +17,11 @@ use indexer_rs::{
         },
         postgres::{
             connection::{PgPool, build_pool},
+            job_repository::{EnqueueResult, NewJob},
             ledger_repository::LedgerRepository,
             repositories::PostgresRepositories,
             schema::{
-                chains, events, ledger_entries, reorg_events, sources, token_balances,
+                chains, events, jobs, ledger_entries, reorg_events, sources, token_balances,
                 transaction_receipts,
             },
         },
@@ -155,6 +157,63 @@ async fn records_mismatched_indexed_and_checkpoint_hashes() {
         json!(block_hash("bb"))
     );
     assert!(rows[0].replay_job_id.is_none());
+}
+
+#[tokio::test]
+async fn links_replay_job_to_matching_reorg_event_ranges() {
+    let ctx = setup();
+    let source = seed_source_with_indexed_block(&ctx);
+    ctx.repositories
+        .ledger()
+        .advance_checkpoint(source.id, 101, &block_hash("22"), 110)
+        .expect("insert checkpoint");
+    let rpc_url = start_fake_rpc(HashMap::from([
+        (100, block_hash("aa")),
+        (101, block_hash("bb")),
+    ]))
+    .await;
+
+    verify_source_reorgs(
+        &EvmRpcClient::new(rpc_url),
+        ctx.repositories.ledger(),
+        &source,
+        100,
+        101,
+    )
+    .await
+    .expect("verify reorgs");
+
+    let replay_job = ctx
+        .repositories
+        .jobs()
+        .enqueue(
+            NewJob::new(
+                JobType::ReplayRange,
+                ctx.chain_id,
+                format!("it:replay:{}:99:102", source.id),
+            )
+            .with_source(source.id)
+            .with_range(99, 102),
+        )
+        .expect("enqueue replay job");
+    let replay_job_id = match replay_job {
+        EnqueueResult::Inserted(job) | EnqueueResult::Existing(job) => job.id,
+    };
+
+    let linked = ctx
+        .repositories
+        .ledger()
+        .link_reorg_events_to_replay_job(source.id, 99, 102, replay_job_id)
+        .expect("link replay job");
+
+    assert_eq!(linked, 1);
+    let rows = ctx
+        .repositories
+        .ledger()
+        .reorg_events_for_source(source.id)
+        .expect("load reorg events");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].replay_job_id, Some(replay_job_id));
 }
 
 #[tokio::test]
@@ -362,6 +421,18 @@ fn cleanup_chain(conn: &mut PgConnection, chain_id: i64) {
     .bind::<diesel::sql_types::BigInt, _>(chain_id)
     .execute(conn)
     .expect("delete test checkpoints");
+    diesel::sql_query(
+        "DELETE FROM job_attempts
+         USING jobs
+         WHERE job_attempts.job_id = jobs.id
+           AND jobs.chain_id = $1",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(chain_id)
+    .execute(conn)
+    .expect("delete test job attempts");
+    diesel::delete(jobs::table.filter(jobs::chain_id.eq(chain_id)))
+        .execute(conn)
+        .expect("delete test jobs");
     diesel::delete(sources::table.filter(sources::chain_id.eq(chain_id)))
         .execute(conn)
         .expect("delete test sources");

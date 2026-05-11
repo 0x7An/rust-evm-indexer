@@ -1505,22 +1505,48 @@ fn enqueue_replay(
         )
         .context("enqueue replay job")?;
 
-    match result {
+    let (replay_job, should_link_reorg_events) = match result {
         EnqueueResult::Inserted(job) => {
             println!(
                 "Enqueued replay job {} for {} blocks {}..={}",
                 job.id, source.contract_address, from_block, to_block
             );
+            (job, true)
         }
         EnqueueResult::Existing(job) => {
             println!(
                 "Replay job already exists as {} for {} blocks {}..={}",
                 job.id, source.contract_address, from_block, to_block
             );
+            let should_link = !job_status_is_terminal(&job.status);
+            if !should_link {
+                println!(
+                    "Existing replay job {} is terminal with status {}; matching reorg events were not linked.",
+                    job.id, job.status
+                );
+            }
+            (job, should_link)
+        }
+    };
+
+    if should_link_reorg_events {
+        let linked_reorg_events = repositories
+            .ledger()
+            .link_reorg_events_to_replay_job(source.id, from_i64, to_i64, replay_job.id)
+            .context("link replay job to matching reorg events")?;
+        if linked_reorg_events > 0 {
+            println!(
+                "Linked replay job {} to {linked_reorg_events} reorg event(s).",
+                replay_job.id
+            );
         }
     }
 
     Ok(())
+}
+
+fn job_status_is_terminal(status: &str) -> bool {
+    matches!(status, "succeeded" | "dead_lettered" | "cancelled")
 }
 
 async fn backfill_event_metadata(
@@ -2221,6 +2247,40 @@ mod tests {
         );
         assert_eq!(chain_id, 1);
         assert_eq!(contract, "0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d");
+    }
+
+    #[test]
+    fn worker_run_parses_metrics_bind() {
+        let cli = Cli::try_parse_from([
+            "indexer",
+            "worker",
+            "run",
+            "--database-url",
+            "postgres://indexer:indexer@localhost/indexer_rs",
+            "--metrics-bind",
+            "127.0.0.1:9101",
+        ])
+        .expect("parse worker metrics bind");
+
+        let Commands::Worker {
+            command: WorkerCommands::Run { metrics_bind, .. },
+        } = cli.command
+        else {
+            panic!("expected worker run command");
+        };
+
+        assert_eq!(metrics_bind, Some("127.0.0.1:9101".parse().unwrap()));
+    }
+
+    #[test]
+    fn replay_linking_skips_terminal_job_statuses() {
+        assert!(!job_status_is_terminal(JobStatus::Queued.as_str()));
+        assert!(!job_status_is_terminal(JobStatus::Leased.as_str()));
+        assert!(!job_status_is_terminal(JobStatus::Running.as_str()));
+        assert!(!job_status_is_terminal(JobStatus::Failed.as_str()));
+        assert!(job_status_is_terminal(JobStatus::Succeeded.as_str()));
+        assert!(job_status_is_terminal(JobStatus::DeadLettered.as_str()));
+        assert!(job_status_is_terminal(JobStatus::Cancelled.as_str()));
     }
 
     #[test]

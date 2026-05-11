@@ -469,6 +469,26 @@ impl LedgerRepository {
             .context("load reorg events for source")
     }
 
+    pub fn link_reorg_events_to_replay_job(
+        &self,
+        source_id: Uuid,
+        replay_from_block: i64,
+        replay_to_block: i64,
+        replay_job_id: Uuid,
+    ) -> Result<usize> {
+        let mut conn = self.connection()?;
+        diesel::update(
+            reorg_events::table
+                .filter(reorg_events::source_id.eq(source_id))
+                .filter(reorg_events::from_block.ge(replay_from_block))
+                .filter(reorg_events::to_block.le(replay_to_block))
+                .filter(reorg_events::replay_job_id.is_null()),
+        )
+        .set(reorg_events::replay_job_id.eq(Some(replay_job_id)))
+        .execute(&mut conn)
+        .context("link reorg events to replay job")
+    }
+
     pub fn orphan_source_range(
         &self,
         source: &SourceRow,
