@@ -12,13 +12,12 @@ CREATE TABLE sources (
     chain_id BIGINT NOT NULL REFERENCES chains(chain_id),
     name TEXT NOT NULL,
     contract_address TEXT NOT NULL,
-    token_standard TEXT NOT NULL DEFAULT 'auto',
-    event_signatures JSONB NOT NULL,
+    token_standard TEXT NOT NULL,
     start_block BIGINT NOT NULL,
     enabled BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(chain_id, contract_address),
-    CHECK (token_standard IN ('auto', 'erc20', 'erc721', 'erc1155')),
+    CHECK (token_standard IN ('erc20', 'erc721', 'erc1155')),
     CHECK (start_block >= 0)
 );
 

@@ -127,7 +127,6 @@ diesel::table! {
         name -> Text,
         contract_address -> Text,
         token_standard -> Text,
-        event_signatures -> Jsonb,
         start_block -> Int8,
         enabled -> Bool,
         created_at -> Timestamptz,

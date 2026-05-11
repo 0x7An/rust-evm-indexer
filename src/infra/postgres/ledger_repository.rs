@@ -230,20 +230,6 @@ impl LedgerRepository {
                 name: name.to_string(),
                 contract_address: contract_address.to_ascii_lowercase(),
                 token_standard: standard.as_str().to_string(),
-                event_signatures: match standard {
-                    TokenStandard::Auto => {
-                        unreachable!("auto token standard is rejected before source persistence")
-                    }
-                    TokenStandard::Erc20 | TokenStandard::Erc721 => {
-                        json!(["Transfer(address,address,uint256)"])
-                    }
-                    TokenStandard::Erc1155 => {
-                        json!([
-                            "TransferSingle(address,address,address,uint256,uint256)",
-                            "TransferBatch(address,address,address,uint256[],uint256[])"
-                        ])
-                    }
-                },
                 start_block,
                 enabled: true,
             })
@@ -252,7 +238,6 @@ impl LedgerRepository {
             .set((
                 sources::name.eq(name),
                 sources::token_standard.eq(standard.as_str()),
-                sources::event_signatures.eq(excluded(sources::event_signatures)),
                 sources::start_block.eq(start_block),
                 sources::enabled.eq(true),
             ))

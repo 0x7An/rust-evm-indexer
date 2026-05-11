@@ -39,7 +39,6 @@ pub struct SourceRow {
     pub name: String,
     pub contract_address: String,
     pub token_standard: String,
-    pub event_signatures: Value,
     pub start_block: i64,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
@@ -71,7 +70,6 @@ pub struct NewSourceRow {
     pub name: String,
     pub contract_address: String,
     pub token_standard: String,
-    pub event_signatures: Value,
     pub start_block: i64,
     pub enabled: bool,
 }
