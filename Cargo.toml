@@ -21,8 +21,10 @@ bigdecimal = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 diesel = { version = "2", features = ["postgres", "r2d2", "uuid", "chrono", "serde_json", "numeric"] }
+diesel_migrations = "2"
 dotenvy = "0.15"
 hex = "0.4"
+prometheus = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,6 +32,4 @@ sha3 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
-[dev-dependencies]
-diesel_migrations = "2"
 tower = { version = "0.5", features = ["util"] }

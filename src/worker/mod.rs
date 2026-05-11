@@ -21,6 +21,7 @@ use crate::{
     infra::{
         evm::rpc::EvmRpcClient,
         postgres::{models::JobRow, repositories::PostgresRepositories},
+        telemetry::metrics,
     },
 };
 
@@ -81,6 +82,7 @@ impl IngestWorker {
         &self,
         shutdown: impl Future<Output = ()>,
     ) -> Result<WorkerOutcome> {
+        self.observe_job_backlog();
         let Some(running) = self.lease_and_mark_running(self.replay_first())? else {
             return Ok(WorkerOutcome::NoJob);
         };
@@ -90,6 +92,7 @@ impl IngestWorker {
             result = self.execute_job(&running) => {
                 let outcome = self.finish_running_job(&running, result)?;
                 self.update_priority_after_outcome(&running, &outcome);
+                self.observe_job_backlog();
                 Ok(outcome)
             }
             _ = &mut shutdown => {
@@ -110,6 +113,7 @@ impl IngestWorker {
     }
 
     async fn run_once_with_current_priority(&self) -> Result<WorkerOutcome> {
+        self.observe_job_backlog();
         let Some(running) = self.lease_and_mark_running(self.replay_first())? else {
             return Ok(WorkerOutcome::NoJob);
         };
@@ -117,6 +121,7 @@ impl IngestWorker {
         let result = self.execute_job(&running).await;
         let outcome = self.finish_running_job(&running, result)?;
         self.update_priority_after_outcome(&running, &outcome);
+        self.observe_job_backlog();
         Ok(outcome)
     }
 
@@ -171,7 +176,7 @@ impl IngestWorker {
     }
 
     fn lease_next_supported_type(&self, job_type: JobType) -> Result<Option<JobRow>> {
-        match self.chain_id {
+        let result = match self.chain_id {
             Some(chain_id) => self.repositories.jobs().lease_next_for_type_and_chain(
                 &self.worker_id,
                 self.lease_for,
@@ -183,8 +188,11 @@ impl IngestWorker {
                 self.lease_for,
                 job_type,
             ),
+        };
+        if result.is_err() {
+            metrics::metrics().inc_worker_lease_failure(&self.metric_chain_id(), job_type.as_str());
         }
-        .context("lease next supported job")
+        result.context("lease next supported job")
     }
 
     fn finish_running_job(
@@ -211,13 +219,53 @@ impl IngestWorker {
                     .jobs()
                     .mark_failed(running.id, "IngestJobError", &message)
                     .context("mark job failed")?;
+                let chain_id = failed.chain_id.to_string();
+                let job_type = failed.job_type.clone();
+                let status = failed.status.clone();
+                metrics::metrics().inc_failed_job(&chain_id, &job_type);
+                if status == JobStatus::DeadLettered.as_str() {
+                    metrics::metrics().inc_dead_letter_job(&chain_id, &job_type);
+                }
                 Ok(WorkerOutcome::Failed {
                     job_id: failed.id,
-                    status: failed.status,
+                    status,
                     error: message,
                 })
             }
         }
+    }
+
+    fn observe_job_backlog(&self) {
+        let Ok(counts) = self
+            .repositories
+            .jobs()
+            .status_counts(self.chain_id, None, None)
+        else {
+            return;
+        };
+        let chain_id = self.metric_chain_id();
+        for status in [
+            JobStatus::Queued,
+            JobStatus::Leased,
+            JobStatus::Running,
+            JobStatus::Succeeded,
+            JobStatus::Failed,
+            JobStatus::DeadLettered,
+            JobStatus::Cancelled,
+        ] {
+            let count = counts
+                .iter()
+                .find(|row| row.status == status.as_str())
+                .map(|row| row.count)
+                .unwrap_or(0);
+            metrics::metrics().set_job_backlog(&chain_id, status.as_str(), count);
+        }
+    }
+
+    fn metric_chain_id(&self) -> String {
+        self.chain_id
+            .map(|chain_id| chain_id.to_string())
+            .unwrap_or_else(|| "all".to_string())
     }
 
     pub async fn run_until_idle(&self, max_jobs: Option<usize>) -> Result<WorkerRunSummary> {
@@ -363,6 +411,12 @@ impl IngestWorker {
                     observed_finalized_block,
                 )
                 .context("advance source checkpoint")?;
+            metrics::metrics().set_source_progress(
+                &source.chain_id.to_string(),
+                &source.id.to_string(),
+                target,
+                observed_finalized_block,
+            );
         }
 
         Ok(summary)
@@ -381,6 +435,8 @@ impl IngestWorker {
 
         let head = self.rpc.block_number().await.context("fetch head block")?;
         let finalized = head.saturating_sub(chain.finality_confirmations as u64);
+        metrics::metrics().set_head_block(&chain_id.to_string(), head);
+        metrics::metrics().set_finalized_block(&chain_id.to_string(), finalized);
         i64::try_from(finalized).context("finalized block exceeds postgres bigint storage")
     }
 }

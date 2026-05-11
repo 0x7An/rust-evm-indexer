@@ -17,6 +17,7 @@ use crate::infra::postgres::{
     },
     repositories::PostgresRepositories,
 };
+use crate::infra::telemetry::metrics;
 
 #[derive(Clone)]
 struct ApiState {
@@ -26,6 +27,7 @@ struct ApiState {
 pub fn router(pool: PgPool) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(prometheus_metrics))
         .route(
             "/chains/{chain_id}/contracts/{contract_address}/summary",
             get(contract_summary),
@@ -53,6 +55,20 @@ pub fn router(pool: PgPool) -> Router {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn prometheus_metrics() -> Response {
+    match metrics::metrics().encode() {
+        Ok(body) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response(),
+        Err(error) => ApiError::internal(format!("encode metrics: {error}")).into_response(),
+    }
 }
 
 async fn contract_summary(

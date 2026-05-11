@@ -5,3 +5,4 @@
 
 pub mod evm;
 pub mod postgres;
+pub mod telemetry;

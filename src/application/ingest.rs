@@ -14,6 +14,7 @@ use crate::application::{
 pub struct ResolvedRange {
     pub from: u64,
     pub to: u64,
+    pub head: u64,
     pub finalized_head: u64,
 }
 
@@ -70,6 +71,7 @@ pub async fn resolve_finalized_range(
     Ok(ResolvedRange {
         from,
         to,
+        head,
         finalized_head,
     })
 }

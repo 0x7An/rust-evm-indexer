@@ -3,6 +3,8 @@ use std::{collections::HashMap, net::SocketAddr, time::Duration as StdDuration};
 use anyhow::{Context, Result, bail};
 use chrono::Duration;
 use clap::{Parser, Subcommand};
+use diesel::{Connection, PgConnection};
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use indexer_rs::{
     api,
     application::{
@@ -24,11 +26,13 @@ use indexer_rs::{
             job_repository::{EnqueueResult, JobStatusCount, NewJob},
             repositories::PostgresRepositories,
         },
+        telemetry::metrics,
     },
     worker::{IngestWorker, WorkerOutcome},
 };
 
 const AUTO_DETECT_CHUNK_SIZE: u64 = 10;
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 #[derive(Debug, Parser)]
 #[command(name = "indexer")]
@@ -291,6 +295,25 @@ enum Commands {
         /// Inclusive end block to verify.
         #[arg(long)]
         to_block: u64,
+    },
+
+    /// Check database, migrations, RPC, source, checkpoint, and job health.
+    Doctor {
+        /// EVM JSON-RPC URL. Prefer EVM_RPC_URL for local use.
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Postgres database URL. Prefer DATABASE_URL for local use.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+
+        /// EVM chain id for the indexed source.
+        #[arg(long, default_value_t = 1)]
+        chain_id: i64,
+
+        /// Contract address for the source to inspect.
+        #[arg(long)]
+        contract: String,
     },
 
     /// Run the HTTP read API for indexed ledger data.
@@ -581,6 +604,21 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Commands::Doctor {
+            rpc_url,
+            database_url,
+            chain_id,
+            contract,
+        } => {
+            let rpc_url = rpc_url_from_args(rpc_url, Some(chain_id))?;
+            doctor(DoctorArgs {
+                rpc_url,
+                database_url,
+                chain_id,
+                contract,
+            })
+            .await
+        }
         Commands::Serve { database_url, bind } => serve_api(database_url, bind).await,
         Commands::Worker { command } => match command {
             WorkerCommands::RunOnce {
@@ -652,6 +690,379 @@ async fn serve_api(database_url: String, bind: SocketAddr) -> Result<()> {
 
     println!("API listening on http://{bind}");
     axum::serve(listener, app).await.context("serve HTTP API")
+}
+
+struct DoctorArgs {
+    rpc_url: String,
+    database_url: String,
+    chain_id: i64,
+    contract: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl DoctorStatus {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorCheck {
+    name: &'static str,
+    status: DoctorStatus,
+    message: String,
+}
+
+impl DoctorCheck {
+    fn ok(name: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: DoctorStatus::Ok,
+            message: message.into(),
+        }
+    }
+
+    fn warn(name: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: DoctorStatus::Warn,
+            message: message.into(),
+        }
+    }
+
+    fn fail(name: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: DoctorStatus::Fail,
+            message: message.into(),
+        }
+    }
+}
+
+async fn doctor(args: DoctorArgs) -> Result<()> {
+    let DoctorArgs {
+        rpc_url,
+        database_url,
+        chain_id,
+        contract,
+    } = args;
+    if chain_id <= 0 {
+        bail!("chain-id must be greater than zero");
+    }
+
+    let mut checks = Vec::new();
+    let contract = match normalize_address(&contract) {
+        Ok(contract) => Some(contract),
+        Err(error) => {
+            checks.push(DoctorCheck::fail("source config valid", error.to_string()));
+            None
+        }
+    };
+
+    let mut db_connected = false;
+    match PgConnection::establish(&database_url) {
+        Ok(mut conn) => {
+            db_connected = true;
+            checks.push(DoctorCheck::ok("DB connection", "connected to Postgres"));
+            match conn.pending_migrations(MIGRATIONS) {
+                Ok(pending) if pending.is_empty() => {
+                    checks.push(DoctorCheck::ok(
+                        "migrations applied",
+                        "no pending migrations",
+                    ));
+                }
+                Ok(pending) => {
+                    let pending = pending
+                        .iter()
+                        .map(|migration| migration.name().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    checks.push(DoctorCheck::fail(
+                        "migrations applied",
+                        format!("pending migrations: {pending}"),
+                    ));
+                }
+                Err(error) => checks.push(DoctorCheck::fail(
+                    "migrations applied",
+                    format!("could not inspect migrations: {error}"),
+                )),
+            }
+        }
+        Err(error) => {
+            checks.push(DoctorCheck::fail(
+                "DB connection",
+                format!("could not connect to Postgres: {error}"),
+            ));
+            checks.push(DoctorCheck::fail(
+                "migrations applied",
+                "skipped because DB connection failed",
+            ));
+        }
+    }
+
+    let rpc = EvmRpcClient::new(&rpc_url);
+    match rpc.block_number().await {
+        Ok(head) => {
+            checks.push(DoctorCheck::ok(
+                "RPC reachable",
+                "eth_blockNumber succeeded",
+            ));
+            checks.push(DoctorCheck::ok(
+                "chain head readable",
+                format!("head block {head}"),
+            ));
+        }
+        Err(error) => {
+            checks.push(DoctorCheck::fail(
+                "RPC reachable",
+                format!("eth_blockNumber failed: {error}"),
+            ));
+            checks.push(DoctorCheck::fail(
+                "chain head readable",
+                "skipped because RPC head read failed",
+            ));
+        }
+    }
+
+    if db_connected {
+        match build_pool(&database_url).context("build postgres pool") {
+            Ok(pool) => {
+                let repositories = PostgresRepositories::new(pool);
+                doctor_source_checks(&mut checks, &repositories, chain_id, contract.as_deref());
+            }
+            Err(error) => {
+                checks.push(DoctorCheck::fail(
+                    "source config valid",
+                    format!("could not build Postgres pool: {error}"),
+                ));
+                checks.push(DoctorCheck::fail(
+                    "checkpoint exists",
+                    "skipped because repository pool failed",
+                ));
+                checks.push(DoctorCheck::fail(
+                    "job backlog",
+                    "skipped because repository pool failed",
+                ));
+                checks.push(DoctorCheck::fail(
+                    "dead-letter counts",
+                    "skipped because repository pool failed",
+                ));
+            }
+        }
+    } else {
+        checks.push(DoctorCheck::fail(
+            "source config valid",
+            "skipped because DB connection failed",
+        ));
+        checks.push(DoctorCheck::fail(
+            "checkpoint exists",
+            "skipped because DB connection failed",
+        ));
+        checks.push(DoctorCheck::fail(
+            "job backlog",
+            "skipped because DB connection failed",
+        ));
+        checks.push(DoctorCheck::fail(
+            "dead-letter counts",
+            "skipped because DB connection failed",
+        ));
+    }
+
+    print_doctor_report(&checks);
+    let failures = checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Fail)
+        .count();
+    if failures > 0 {
+        bail!("doctor found {failures} failing check(s)");
+    }
+
+    Ok(())
+}
+
+fn doctor_source_checks(
+    checks: &mut Vec<DoctorCheck>,
+    repositories: &PostgresRepositories,
+    chain_id: i64,
+    contract: Option<&str>,
+) {
+    let Some(contract) = contract else {
+        checks.push(DoctorCheck::fail(
+            "checkpoint exists",
+            "skipped because contract address is invalid",
+        ));
+        checks.push(DoctorCheck::fail(
+            "job backlog",
+            "skipped because contract address is invalid",
+        ));
+        checks.push(DoctorCheck::fail(
+            "dead-letter counts",
+            "skipped because contract address is invalid",
+        ));
+        return;
+    };
+
+    let chain = match repositories.ledger().chain_by_chain_id(chain_id) {
+        Ok(Some(chain)) => Some(chain),
+        Ok(None) => {
+            checks.push(DoctorCheck::fail(
+                "source config valid",
+                format!("chain {chain_id} is not configured"),
+            ));
+            None
+        }
+        Err(error) => {
+            checks.push(DoctorCheck::fail(
+                "source config valid",
+                format!("could not load chain config: {error}"),
+            ));
+            None
+        }
+    };
+
+    let source = match repositories.ledger().source_by_contract(chain_id, contract) {
+        Ok(Some(source)) => Some(source),
+        Ok(None) => {
+            checks.push(DoctorCheck::fail(
+                "source config valid",
+                format!("source for {contract} on chain {chain_id} was not found"),
+            ));
+            None
+        }
+        Err(error) => {
+            checks.push(DoctorCheck::fail(
+                "source config valid",
+                format!("could not load source config: {error}"),
+            ));
+            None
+        }
+    };
+
+    let Some(source) = source else {
+        checks.push(DoctorCheck::fail(
+            "checkpoint exists",
+            "skipped because source config is missing",
+        ));
+        checks.push(DoctorCheck::fail(
+            "job backlog",
+            "skipped because source config is missing",
+        ));
+        checks.push(DoctorCheck::fail(
+            "dead-letter counts",
+            "skipped because source config is missing",
+        ));
+        return;
+    };
+
+    let mut source_errors = Vec::new();
+    if chain.is_none() {
+        source_errors.push(format!("chain {chain_id} missing"));
+    }
+    if source.contract_address != contract {
+        source_errors.push(format!(
+            "stored contract {} does not match {contract}",
+            source.contract_address
+        ));
+    }
+    match source.token_standard.parse::<TokenStandard>() {
+        Ok(standard) if standard.is_auto() => {
+            source_errors.push("token standard must be detected before persistence".to_string());
+        }
+        Ok(_) => {}
+        Err(error) => source_errors.push(format!("invalid token standard: {error}")),
+    }
+    if source.start_block < 0 {
+        source_errors.push(format!("start_block {} is negative", source.start_block));
+    }
+    if !source.enabled {
+        source_errors.push("source is disabled".to_string());
+    }
+
+    if source_errors.is_empty() {
+        checks.push(DoctorCheck::ok(
+            "source config valid",
+            format!(
+                "source {} {} from block {}",
+                source.id, source.token_standard, source.start_block
+            ),
+        ));
+    } else {
+        checks.push(DoctorCheck::fail(
+            "source config valid",
+            source_errors.join("; "),
+        ));
+    }
+
+    match repositories.ledger().checkpoint_for_source(source.id) {
+        Ok(Some(checkpoint)) => checks.push(DoctorCheck::ok(
+            "checkpoint exists",
+            format!(
+                "processed block {} finalized block {}",
+                checkpoint.processed_block, checkpoint.finalized_block
+            ),
+        )),
+        Ok(None) => checks.push(DoctorCheck::fail(
+            "checkpoint exists",
+            "source has no checkpoint",
+        )),
+        Err(error) => checks.push(DoctorCheck::fail(
+            "checkpoint exists",
+            format!("could not load checkpoint: {error}"),
+        )),
+    }
+
+    match repositories
+        .jobs()
+        .status_counts(Some(chain_id), Some(source.id), None)
+    {
+        Ok(counts) => {
+            let backlog = job_count(&counts, JobStatus::Queued)
+                + job_count(&counts, JobStatus::Leased)
+                + job_count(&counts, JobStatus::Running)
+                + job_count(&counts, JobStatus::Failed);
+            let dead_letters = job_count(&counts, JobStatus::DeadLettered);
+            if backlog == 0 {
+                checks.push(DoctorCheck::ok("job backlog", "no active backlog"));
+            } else {
+                checks.push(DoctorCheck::warn(
+                    "job backlog",
+                    format!("{backlog} queued/leased/running/failed job(s)"),
+                ));
+            }
+
+            if dead_letters == 0 {
+                checks.push(DoctorCheck::ok(
+                    "dead-letter counts",
+                    "no dead-lettered jobs",
+                ));
+            } else {
+                checks.push(DoctorCheck::warn(
+                    "dead-letter counts",
+                    format!("{dead_letters} dead-lettered job(s)"),
+                ));
+            }
+        }
+        Err(error) => {
+            checks.push(DoctorCheck::fail(
+                "job backlog",
+                format!("could not load job status counts: {error}"),
+            ));
+            checks.push(DoctorCheck::fail(
+                "dead-letter counts",
+                format!("could not load job status counts: {error}"),
+            ));
+        }
+    }
 }
 
 struct ScanContractArgs {
@@ -747,6 +1158,7 @@ async fn scan_contract(args: ScanContractArgs) -> Result<()> {
         finality_confirmations,
     )
     .await?;
+    record_resolved_range_metrics(chain_id, &range);
     let chain_label = format!("{chain_name} ({chain_id})");
     validate_contract_code_at_boundaries(&rpc, &contract, &chain_label, range.from, range.to)
         .await?;
@@ -871,6 +1283,7 @@ async fn enqueue_contract(args: EnqueueContractArgs) -> Result<()> {
         finality_confirmations,
     )
     .await?;
+    record_resolved_range_metrics(chain_id, &range);
     let chain_label = format!("{chain_name} ({chain_id})");
     validate_contract_code_at_boundaries(&rpc, &contract, &chain_label, range.from, range.to)
         .await?;
@@ -989,6 +1402,7 @@ async fn backfill_contract(args: BackfillContractArgs) -> Result<()> {
         finality_confirmations,
     )
     .await?;
+    record_resolved_range_metrics(chain_id, &range);
     let chain_label = format!("{chain_name} ({chain_id})");
     validate_contract_code_at_boundaries(&rpc, &contract, &chain_label, range.from, range.to)
         .await?;
@@ -1032,6 +1446,13 @@ async fn backfill_contract(args: BackfillContractArgs) -> Result<()> {
         range_size,
         max_attempts,
     )?;
+    record_source_progress_metric(
+        &repositories,
+        source.id,
+        source.chain_id,
+        source.start_block,
+        range.to as i64,
+    );
     print_backfill_plan(&source.contract_address, &chain_name, chain_id, &plan);
 
     Ok(())
@@ -1280,6 +1701,11 @@ async fn verify_reorg(
     let rpc = EvmRpcClient::new(&rpc_url);
     let verification =
         verify_source_reorgs(&rpc, repositories.ledger(), &source, from_block, to_block).await?;
+    metrics::metrics().inc_reorgs_detected(
+        &chain_id.to_string(),
+        &source.id.to_string(),
+        verification.mismatches.len() as u64,
+    );
 
     println!(
         "Verified {} indexed/checkpointed block hashes for {contract} on chain {chain_id} over blocks {from_block}..={to_block}.",
@@ -1539,6 +1965,57 @@ fn print_job_status_counts(counts: &[JobStatusCount]) {
     println!("Total jobs: {total}");
 }
 
+fn job_count(counts: &[JobStatusCount], status: JobStatus) -> i64 {
+    counts
+        .iter()
+        .find(|row| row.status == status.as_str())
+        .map(|row| row.count)
+        .unwrap_or(0)
+}
+
+fn record_resolved_range_metrics(
+    chain_id: i64,
+    range: &indexer_rs::application::ingest::ResolvedRange,
+) {
+    let chain_id = chain_id.to_string();
+    metrics::metrics().set_head_block(&chain_id, range.head);
+    metrics::metrics().set_finalized_block(&chain_id, range.finalized_head);
+}
+
+fn record_source_progress_metric(
+    repositories: &PostgresRepositories,
+    source_id: uuid::Uuid,
+    chain_id: i64,
+    start_block: i64,
+    finalized_block: i64,
+) {
+    let processed_block = repositories
+        .ledger()
+        .checkpoint_for_source(source_id)
+        .ok()
+        .flatten()
+        .map(|checkpoint| checkpoint.processed_block)
+        .unwrap_or_else(|| start_block.saturating_sub(1));
+    metrics::metrics().set_source_progress(
+        &chain_id.to_string(),
+        &source_id.to_string(),
+        processed_block,
+        finalized_block,
+    );
+}
+
+fn print_doctor_report(checks: &[DoctorCheck]) {
+    println!("Doctor checks:");
+    for check in checks {
+        println!(
+            "- [{status}] {name}: {message}",
+            status = check.status.label(),
+            name = check.name,
+            message = check.message
+        );
+    }
+}
+
 fn print_backfill_plan(contract: &str, chain_name: &str, chain_id: i64, plan: &BackfillPlan) {
     println!(
         "Backfill plan for {contract} on {chain_name} ({chain_id}) requested blocks {from}..={to}.",
@@ -1667,5 +2144,51 @@ mod tests {
             panic!("expected worker run command");
         };
         assert_eq!(run_lease, 60);
+    }
+
+    #[test]
+    fn doctor_command_parses_source_scope() {
+        let cli = Cli::try_parse_from([
+            "indexer",
+            "doctor",
+            "--database-url",
+            "postgres://indexer:indexer@localhost/indexer_rs",
+            "--rpc-url",
+            "https://eth-mainnet.example",
+            "--chain-id",
+            "1",
+            "--contract",
+            "0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d",
+        ])
+        .expect("parse doctor");
+
+        let Commands::Doctor {
+            rpc_url,
+            database_url,
+            chain_id,
+            contract,
+        } = cli.command
+        else {
+            panic!("expected doctor command");
+        };
+
+        assert_eq!(rpc_url.as_deref(), Some("https://eth-mainnet.example"));
+        assert_eq!(
+            database_url,
+            "postgres://indexer:indexer@localhost/indexer_rs"
+        );
+        assert_eq!(chain_id, 1);
+        assert_eq!(contract, "0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d");
+    }
+
+    #[test]
+    fn job_count_returns_zero_for_missing_status() {
+        let counts = vec![JobStatusCount {
+            status: JobStatus::Queued.to_string(),
+            count: 7,
+        }];
+
+        assert_eq!(job_count(&counts, JobStatus::Queued), 7);
+        assert_eq!(job_count(&counts, JobStatus::DeadLettered), 0);
     }
 }

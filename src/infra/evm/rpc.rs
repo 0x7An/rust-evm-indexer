@@ -10,6 +10,7 @@ use crate::application::{
     evm::{RpcLog, TokenStandard, parse_hex_u64, supported_topic0_values},
     ports::{ChainRpc, TransactionReceipt},
 };
+use crate::infra::telemetry::metrics;
 
 pub type RpcTransactionReceipt = TransactionReceipt;
 
@@ -139,6 +140,14 @@ impl EvmRpcClient {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let result = self.call_inner(method, params).await;
+        if result.is_err() {
+            metrics::metrics().inc_rpc_error(method);
+        }
+        result
+    }
+
+    async fn call_inner(&self, method: &str, params: Value) -> Result<Value> {
         let response = self
             .client
             .post(&self.url)

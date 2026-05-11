@@ -372,6 +372,19 @@ cargo run -- jobs status \
   --job-type INGEST_RANGE
 ```
 
+Run an operator health check for a configured source:
+
+```sh
+cargo run -- doctor \
+  --chain-id 1 \
+  --contract 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d
+```
+
+`doctor` checks the Postgres connection, pending Diesel migrations, RPC
+reachability, readable chain head, stored source configuration, source
+checkpoint, active job backlog, and dead-lettered job count. It exits non-zero
+for failed required checks and prints warnings for backlog or dead-lettered jobs.
+
 For an ERC-721 full-history run such as Bored Ape Yacht Club, use the Ethereum chain id, the BAYC contract, and a deployment/start block:
 
 ```sh
@@ -400,6 +413,17 @@ Health check:
 ```sh
 curl http://127.0.0.1:3000/health
 ```
+
+Prometheus metrics:
+
+```sh
+curl http://127.0.0.1:3000/metrics
+```
+
+The metrics endpoint exposes job backlog/failure counters, worker lease
+failures, processed event counters, RPC error counters, DB write duration
+histograms, head/finalized/processed block gauges, source lag, and detected
+reorg counters.
 
 Contract summary for an indexed Ethereum ERC-721 slice:
 

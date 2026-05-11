@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use anyhow::{Context, Result};
 use bigdecimal::{
@@ -26,6 +26,7 @@ use crate::{
         },
     },
     domain::job::{JobStatus, JobType},
+    infra::telemetry::metrics,
 };
 
 use super::{
@@ -274,8 +275,9 @@ impl LedgerRepository {
         options: PersistDecodedLogsOptions,
     ) -> Result<ScanSummary> {
         let source = SourceRef::from_source(source);
+        let started = Instant::now();
         let mut conn = self.connection()?;
-        conn.transaction::<ScanSummary, anyhow::Error, _>(|conn| {
+        let result = conn.transaction::<ScanSummary, anyhow::Error, _>(|conn| {
             self.lock_source_for_write_conn(conn, &source)?;
             let mut events_persisted = 0;
             let mut ledger_entries_persisted = 0;
@@ -324,7 +326,20 @@ impl LedgerRepository {
                 top_holders,
             })
         })
-        .context("persist decoded logs")
+        .context("persist decoded logs");
+        metrics::metrics().observe_db_write_ms(
+            "persist_decoded_logs",
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        if let Ok(summary) = &result {
+            metrics::metrics().inc_events_processed(
+                &source.chain_id.to_string(),
+                &source.contract_address,
+                &source.token_standard,
+                summary.events_persisted as u64,
+            );
+        }
+        result
     }
 
     pub fn persist_transaction_receipts(
@@ -332,17 +347,24 @@ impl LedgerRepository {
         chain_id: i64,
         receipts: &[TransactionReceipt],
     ) -> Result<usize> {
+        let started = Instant::now();
         let mut conn = self.connection()?;
-        conn.transaction::<usize, anyhow::Error, _>(|conn| {
-            let mut persisted = 0;
-            for receipt in receipts {
-                self.upsert_transaction_receipt(conn, chain_id, receipt)?;
-                persisted += 1;
-            }
+        let result = conn
+            .transaction::<usize, anyhow::Error, _>(|conn| {
+                let mut persisted = 0;
+                for receipt in receipts {
+                    self.upsert_transaction_receipt(conn, chain_id, receipt)?;
+                    persisted += 1;
+                }
 
-            Ok(persisted)
-        })
-        .context("persist transaction receipts")
+                Ok(persisted)
+            })
+            .context("persist transaction receipts");
+        metrics::metrics().observe_db_write_ms(
+            "persist_transaction_receipts",
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        result
     }
 
     pub fn transaction_hashes_missing_receipts(
